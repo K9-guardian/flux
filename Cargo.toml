@@ -1,44 +1,82 @@
 [workspace]
 default-members = ["crates/*", "xtask"]
-members = ["crates/*", "lib/*", "xtask"]
+members = ["crates/*", "flux-dev", "lib/*", "tests", "xtask"]
 resolver = "2"
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 
 [workspace.dependencies]
-flux-attrs = { path = "./crates/flux-attrs", version = "0.1.0" }
-flux-bin = { path = "./crates/flux-bin", version = "0.1.0" }
+flux-arc-interner = { path = "./crates/flux-arc-interner", version = "0.1.0" }
+flux-dev = { path = "./flux-dev", version = "0.1.0" }
+flux-sysroot = { path = "./crates/flux-sysroot", version = "0.1.0" }
 flux-common = { path = "./crates/flux-common", version = "0.1.0" }
 flux-config = { path = "./crates/flux-config", version = "0.1.0" }
 flux-desugar = { path = "./crates/flux-desugar", version = "0.1.0" }
 flux-errors = { path = "./crates/flux-errors", version = "0.1.0" }
 flux-fhir-analysis = { path = "./crates/flux-fhir-analysis", version = "0.1.0" }
-flux-fixpoint = { path = "./crates/flux-fixpoint", version = "0.1.0" }
+flux-infer = { path = "./crates/flux-infer", version = "0.1.0" }
 flux-macros = { path = "./crates/flux-macros", version = "0.1.0" }
 flux-metadata = { path = "./crates/flux-metadata", version = "0.1.0" }
 flux-middle = { path = "./crates/flux-middle", version = "0.1.0" }
+flux-opt = { path = "./crates/flux-opt", version = "0.1.0" }
 flux-refineck = { path = "./crates/flux-refineck", version = "0.1.0" }
-flux-rs = { path = "./crates/flux-rs", version = "0.1.0" }
+flux-rustc-bridge = { path = "./crates/flux-rustc-bridge", version = "0.1.0" }
 flux-syntax = { path = "./crates/flux-syntax", version = "0.1.0" }
-flux-tests = { path = "./crates/flux-tests", version = "0.1.0" }
 
-home = "0.5.5"
-itertools = "0.10.5"
+liquid-fixpoint = { path = "./lib/liquid-fixpoint", version = "0.1.0", features = [
+    "nightly",
+] }
+
+anstream = "0.6.21"
+anstyle = "1.0.13"
+anyhow = "1.0.97"
+bumpalo = "3.17.0"
+bitflags = "2.9.4"
+cargo_metadata = "0.23.0"
+clap = { version = "4.5", features = ["derive"] }
+config = { version = "0.15.11", features = ["toml"], default-features = false }
+dashmap = { version = "5.5.3", features = ["raw-api"] }
+derive-where = "1.2.7"
+ena = "0.14.3"
+globset = "0.4"
+hashbrown = "0.14.5"
+home = "0.5.11"
+indexmap = "2.12.0"
+itertools = "0.14.0"
+pad-adapter = "0.1.1"
+regex = "1.10"
+rustc-hash = "2.1.1"
 serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
+serde_json = "1.0"
+tempfile = "3.19.1"
+toml = "0.9"
+toposort-scc = "0.5.4"
+walkdir = "2.5"
 
 [workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(flux_sysroot)',
+    'cfg(flux)',
+    # Set when building rustc itself; used by `rustc_index::newtype_index!`
+    'cfg(bootstrap)',
+] }
 unused_extern_crates = "warn"
 
 [workspace.lints.rustdoc]
 private_intra_doc_links = "allow"
 
 [workspace.lints.clippy]
-cloned-instead-of-copied = "warn"
-explicit-into-iter-loop = "warn"
-explicit-iter-loop = "warn"
-implicit-clone = "warn"
-inefficient-to-string = "warn"
-mismatching-type-param-order = "warn"
-semicolon-if-nothing-returned = "warn"
+cloned_instead_of_copied = "warn"
+disallowed_methods = "deny"
+explicit_into_iter_loop = "warn"
+explicit_iter_loop = "warn"
+implicit_clone = "warn"
+inefficient_to_string = "warn"
+mismatching_type_param_order = "warn"
+new_without_default = "allow"
+semicolon_if_nothing_returned = "warn"
+
+[profile.profiling]
+inherits = "release"
+debug = 1

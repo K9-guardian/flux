@@ -1,368 +1,314 @@
 //! *Refining* is the process of generating a refined version of a rust type.
 //!
-//! Concretely, this module provides functions to go from types in [`rustc::ty`] to types in [`rty`].
-use flux_common::{bug, iter::IterExt};
+//! Concretely, this module provides functions to go from types in [`flux_rustc_bridge::ty`] to
+//! types in [`rty`].
+
+use flux_arc_interner::{List, SliceInternable};
+use flux_common::bug;
+use flux_rustc_bridge::{ty, ty::GenericArgsExt as _};
 use itertools::Itertools;
+use rustc_abi::VariantIdx;
+use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::DefId;
-use rustc_middle::ty::{ClosureKind, ParamTy};
+use rustc_middle::ty::ParamTy;
+use rustc_span::Symbol;
+use rustc_type_ir::INNERMOST;
 
-use super::fold::TypeFoldable;
-use crate::{global_env::GlobalEnv, intern::List, queries::QueryResult, rty, rustc};
+use super::{
+    RefineArgsExt,
+    fold::{TypeFoldable, TypeFolder, TypeVisitable},
+};
+use crate::{
+    global_env::{GlobalEnv, WeakKvarInfo, WeakKvarMap},
+    queries::{QueryErr, QueryResult},
+    query_bug,
+    rty::{self, Expr, fold::TypeSuperFoldable},
+};
 
-pub(crate) fn refine_generics(generics: &rustc::ty::Generics) -> QueryResult<rty::Generics> {
+pub fn refine_generics(generics: &ty::Generics) -> rty::Generics {
     let params = generics
         .params
         .iter()
-        .map(|param| {
-            let kind = match param.kind {
-                rustc::ty::GenericParamDefKind::Lifetime => rty::GenericParamDefKind::Lifetime,
-                rustc::ty::GenericParamDefKind::Type { has_default } => {
-                    rty::GenericParamDefKind::Type { has_default }
-                }
-                rustc::ty::GenericParamDefKind::Const { has_default } => {
-                    rty::GenericParamDefKind::Const { has_default }
-                }
-            };
-            rty::GenericParamDef {
-                kind,
-                index: param.index,
-                name: param.name,
-                def_id: param.def_id,
-            }
-        })
+        .map(|param| refine_generic_param_def(false, param))
         .collect();
 
-    Ok(rty::Generics { params, parent: generics.parent(), parent_count: generics.parent_count() })
+    rty::Generics {
+        own_params: params,
+        parent: generics.parent(),
+        parent_count: generics.parent_count(),
+        has_self: generics.orig.has_self,
+    }
 }
 
-pub struct Refiner<'a, 'tcx> {
-    genv: &'a GlobalEnv<'a, 'tcx>,
-    generics: &'a rty::Generics,
-    refine: fn(rty::BaseTy) -> rty::Binder<rty::Ty>,
+pub(crate) fn refine_generic_param_def(
+    as_type: bool,
+    param: &ty::GenericParamDef,
+) -> rty::GenericParamDef {
+    rty::GenericParamDef {
+        kind: refine_generic_param_def_kind(as_type, param.kind),
+        index: param.index,
+        name: param.name,
+        def_id: param.def_id,
+    }
 }
 
-impl<'a, 'tcx> Refiner<'a, 'tcx> {
-    pub(crate) fn new(
-        genv: &'a GlobalEnv<'a, 'tcx>,
-        generics: &'a rty::Generics,
-        refine: fn(rty::BaseTy) -> rty::Binder<rty::Ty>,
-    ) -> Self {
-        Self { genv, generics, refine }
-    }
-
-    pub fn default(genv: &'a GlobalEnv<'a, 'tcx>, generics: &'a rty::Generics) -> Self {
-        Self { genv, generics, refine: refine_default }
-    }
-
-    pub(crate) fn with_holes(genv: &'a GlobalEnv<'a, 'tcx>, generics: &'a rty::Generics) -> Self {
-        Self {
-            genv,
-            generics,
-            refine: |bty| {
-                let sort = bty.sort();
-                let indexed = rty::Ty::indexed(bty.shift_in_escaping(1), rty::Expr::nu());
-                let constr = rty::Ty::constr(rty::Expr::hole(rty::HoleKind::Pred), indexed);
-                rty::Binder::with_sort(constr, sort)
-            },
+fn refine_generic_param_def_kind(
+    as_type: bool,
+    kind: ty::GenericParamDefKind,
+) -> rty::GenericParamDefKind {
+    match kind {
+        ty::GenericParamDefKind::Lifetime => rty::GenericParamDefKind::Lifetime,
+        ty::GenericParamDefKind::Type { has_default } => {
+            if as_type {
+                rty::GenericParamDefKind::Type { has_default }
+            } else {
+                rty::GenericParamDefKind::Base { has_default }
+            }
+        }
+        ty::GenericParamDefKind::Const { has_default, .. } => {
+            rty::GenericParamDefKind::Const { has_default }
         }
     }
+}
 
-    pub(crate) fn refine_generic_predicates(
-        &self,
-        generics: &rustc::ty::GenericPredicates,
-    ) -> QueryResult<rty::GenericPredicates> {
-        Ok(rty::GenericPredicates {
-            parent: generics.parent,
-            predicates: self.refine_clauses(&generics.predicates)?,
+/// The type of a `static` without a flux spec: the default refinement of its rust type. Reads of
+/// such a static use this type too, so e.g. the field specs of a struct are assumed when reading
+/// from the static, and thus must be checked in its initializer.
+pub fn default_static_ty(genv: GlobalEnv, def_id: DefId) -> QueryResult<rty::Ty> {
+    genv.lower_type_of(def_id)?
+        .skip_binder()
+        .refine(&Refiner::default_for_item(genv, def_id)?)
+}
+
+pub struct Refiner<'genv, 'tcx> {
+    genv: GlobalEnv<'genv, 'tcx>,
+    def_id: DefId,
+    generics: rty::Generics,
+    refine: fn(rty::BaseTy) -> rty::SubsetTyCtor,
+}
+
+impl<'genv, 'tcx> Refiner<'genv, 'tcx> {
+    pub fn new_for_item(
+        genv: GlobalEnv<'genv, 'tcx>,
+        def_id: DefId,
+        refine: fn(rty::BaseTy) -> rty::SubsetTyCtor,
+    ) -> QueryResult<Self> {
+        let generics = genv.generics_of(def_id)?;
+        Ok(Self { genv, def_id, generics, refine })
+    }
+
+    pub fn default_for_item(genv: GlobalEnv<'genv, 'tcx>, def_id: DefId) -> QueryResult<Self> {
+        Self::new_for_item(genv, def_id, refine_default)
+    }
+
+    pub fn with_holes(genv: GlobalEnv<'genv, 'tcx>, def_id: DefId) -> QueryResult<Self> {
+        Self::new_for_item(genv, def_id, |bty| {
+            let sort = bty.sort();
+            let constr = rty::SubsetTy::new(
+                bty.shift_in_escaping(1),
+                rty::Expr::nu(),
+                rty::Expr::hole(rty::HoleKind::Pred),
+            );
+            rty::Binder::bind_with_sort(constr, sort)
         })
     }
 
-    pub(crate) fn refine_clauses(
+    pub fn refine<T: Refine + ?Sized>(&self, t: &T) -> QueryResult<T::Output> {
+        t.refine(self)
+    }
+
+    fn refine_existential_predicate_generic_args(
         &self,
-        clauses: &[rustc::ty::Clause],
-    ) -> QueryResult<List<rty::Clause>> {
-        let clauses = clauses
-            .iter()
-            .flat_map(|clause| self.refine_clause(clauses, clause).transpose())
-            .try_collect()?;
-
-        Ok(clauses)
+        def_id: DefId,
+        args: &ty::GenericArgs,
+    ) -> QueryResult<rty::GenericArgs> {
+        let generics = self.generics_of(def_id)?;
+        args.iter()
+            .enumerate()
+            .map(|(idx, arg)| {
+                // We need to skip the generic for Self
+                let param = generics.param_at(idx + 1, self.genv)?;
+                self.refine_generic_arg(&param, arg)
+            })
+            .try_collect()
     }
 
-    fn refine_clause(
-        &self,
-        clauses: &[rustc::ty::Clause],
-        clause: &rustc::ty::Clause,
-    ) -> QueryResult<Option<rty::Clause>> {
-        let kind = match &clause.kind {
-            rustc::ty::ClauseKind::Trait(trait_pred) => {
-                let trait_ref = &trait_pred.trait_ref;
-                if let Some(kind) = self.genv.tcx.fn_trait_kind_from_def_id(trait_ref.def_id) {
-                    self.refine_fn_trait_pred(clauses, kind, trait_ref)?
-                } else {
-                    let pred = rty::TraitPredicate { trait_ref: self.refine_trait_ref(trait_ref)? };
-                    rty::ClauseKind::Trait(pred)
-                }
-            }
-            rustc::ty::ClauseKind::Projection(proj_pred) => {
-                if self.genv.is_fn_once_output(proj_pred.projection_ty.def_id) {
-                    return Ok(None);
-                }
-                let pred = rty::ProjectionPredicate {
-                    projection_ty: self.refine_alias_ty(
-                        &rustc::ty::AliasKind::Projection,
-                        &proj_pred.projection_ty,
-                    )?,
-                    term: self.as_default().refine_ty(&proj_pred.term)?,
-                };
-                rty::ClauseKind::Projection(pred)
-            }
-            rustc::ty::ClauseKind::TypeOutlives(pred) => {
-                let pred = rty::OutlivesPredicate(self.as_default().refine_ty(&pred.0)?, pred.1);
-                rty::ClauseKind::TypeOutlives(pred)
-            }
-        };
-        let kind = rty::Binder::new(kind, List::empty());
-        Ok(Some(rty::Clause { kind }))
-    }
-
-    fn refine_fn_trait_pred(
-        &self,
-        clauses: &[rustc::ty::Clause],
-        kind: ClosureKind,
-        trait_ref: &rustc::ty::TraitRef,
-    ) -> QueryResult<rty::ClauseKind> {
-        let mut candidates = vec![];
-        for clause in clauses {
-            if let rustc::ty::ClauseKind::Projection(trait_pred) = &clause.kind
-                && self.genv.is_fn_once_output(trait_pred.projection_ty.def_id)
-                && trait_pred.projection_ty.self_ty() == trait_ref.self_ty()
-            {
-                candidates.push(trait_pred);
-            }
-        }
-        assert!(candidates.len() == 1);
-        let pred = candidates.first().unwrap();
-
-        let pred = rty::FnTraitPredicate {
-            kind,
-            self_ty: self.refine_ty(trait_ref.args[0].expect_type())?,
-            tupled_args: self.refine_ty(trait_ref.args[1].expect_type())?,
-            output: self.refine_ty(&pred.term)?,
-        };
-        Ok(rty::ClauseKind::FnTrait(pred))
-    }
-
-    fn refine_trait_ref(&self, trait_ref: &rustc::ty::TraitRef) -> QueryResult<rty::TraitRef> {
-        let trait_ref = rty::TraitRef {
-            def_id: trait_ref.def_id,
-            args: trait_ref
-                .args
-                .iter()
-                .map(|arg| self.refine_generic_arg_raw(arg))
-                .try_collect()?,
-        };
-        Ok(trait_ref)
-    }
-
-    pub(crate) fn refine_variant_def(
+    pub fn refine_variant_def(
         &self,
         adt_def_id: DefId,
-        fields: &[rustc::ty::Ty],
+        variant_idx: VariantIdx,
     ) -> QueryResult<rty::PolyVariant> {
         let adt_def = self.adt_def(adt_def_id)?;
-        let fields = fields.iter().map(|ty| self.refine_ty(ty)).try_collect()?;
+        let variant_def = adt_def.variant(variant_idx);
+        let fields = variant_def
+            .fields
+            .iter()
+            .map(|fld| {
+                let ty = self.genv.lower_type_of(fld.did)?.instantiate_identity();
+                ty.refine(self)
+            })
+            .try_collect()?;
+
+        let idx = if adt_def.sort_def().is_struct() {
+            rty::Expr::unit_struct(adt_def_id)
+        } else {
+            rty::Expr::ctor_enum(adt_def_id, variant_idx)
+        };
         let value = rty::VariantSig::new(
             adt_def,
-            rty::GenericArgs::identity_for_item(self.genv, adt_def_id)?,
+            rty::GenericArg::identity_for_item(self.genv, adt_def_id)?,
             fields,
-            rty::Expr::unit_adt(adt_def_id),
+            idx,
+            List::empty(),
         );
-        Ok(rty::Binder::new(value, List::empty()))
+
+        Ok(rty::Binder::bind_with_vars(value, List::empty()))
     }
 
-    pub(crate) fn refine_binders<S, T, F>(
+    pub fn refine_generic_args(
         &self,
-        thing: &rustc::ty::Binder<S>,
-        mut f: F,
-    ) -> QueryResult<rty::Binder<T>>
-    where
-        F: FnMut(&S) -> QueryResult<T>,
-    {
-        let vars = refine_bound_variables(thing.vars());
-        let inner = thing.as_ref().skip_binder();
-        let inner = f(inner)?;
-        Ok(rty::Binder::new(inner, vars))
+        def_id: DefId,
+        args: &ty::GenericArgs,
+    ) -> QueryResult<rty::GenericArgs> {
+        let generics = self.generics_of(def_id)?;
+        args.iter()
+            .enumerate()
+            .map(|(idx, arg)| {
+                let param = generics.param_at(idx, self.genv)?;
+                self.refine_generic_arg(&param, arg)
+            })
+            .collect()
     }
 
-    pub(crate) fn refine_poly_fn_sig(
-        &self,
-        fn_sig: &rustc::ty::PolyFnSig,
-    ) -> QueryResult<rty::PolyFnSig> {
-        self.refine_binders(fn_sig, |fn_sig| {
-            let args = fn_sig
-                .inputs()
-                .iter()
-                .map(|ty| self.refine_ty(ty))
-                .try_collect_vec()?;
-            let ret = self.refine_ty(fn_sig.output())?.shift_in_escaping(1);
-            let output = rty::Binder::new(rty::FnOutput::new(ret, vec![]), List::empty());
-            Ok(rty::FnSig::new(vec![], args, output))
-        })
-    }
-
-    pub(crate) fn refine_generic_arg(
+    pub fn refine_generic_arg(
         &self,
         param: &rty::GenericParamDef,
-        arg: &rustc::ty::GenericArg,
+        arg: &ty::GenericArg,
     ) -> QueryResult<rty::GenericArg> {
         match (&param.kind, arg) {
-            (rty::GenericParamDefKind::Type { .. }, rustc::ty::GenericArg::Ty(ty)) => {
-                Ok(rty::GenericArg::Ty(self.refine_ty(ty)?))
+            (rty::GenericParamDefKind::Type { .. }, ty::GenericArg::Ty(ty)) => {
+                Ok(rty::GenericArg::Ty(ty.refine(self)?))
             }
-            (rty::GenericParamDefKind::SplTy, rustc::ty::GenericArg::Ty(ty)) => {
-                Ok(rty::GenericArg::Ty(self.refine_ty(ty)?))
+            (rty::GenericParamDefKind::Base { .. }, ty::GenericArg::Ty(ty)) => {
+                let rty::TyOrBase::Base(contr) = self.refine_ty_or_base(ty)? else {
+                    return Err(QueryErr::InvalidGenericArg { def_id: param.def_id });
+                };
+                Ok(rty::GenericArg::Base(contr))
             }
-            (rty::GenericParamDefKind::BaseTy, rustc::ty::GenericArg::Ty(ty)) => {
-                Ok(rty::GenericArg::BaseTy(self.refine_poly_ty(ty)?))
-            }
-            (rty::GenericParamDefKind::Lifetime, rustc::ty::GenericArg::Lifetime(re)) => {
+            (rty::GenericParamDefKind::Lifetime, ty::GenericArg::Lifetime(re)) => {
                 Ok(rty::GenericArg::Lifetime(*re))
             }
-            (rty::GenericParamDefKind::Const { .. }, rustc::ty::GenericArg::Const(ct)) => {
+            (rty::GenericParamDefKind::Const { .. }, ty::GenericArg::Const(ct)) => {
                 Ok(rty::GenericArg::Const(ct.clone()))
             }
             _ => bug!("mismatched generic arg `{arg:?}` `{param:?}`"),
         }
     }
 
-    pub(crate) fn refine_generic_arg_raw(
-        &self,
-        arg: &rustc::ty::GenericArg,
-    ) -> QueryResult<rty::GenericArg> {
-        match arg {
-            rustc::ty::GenericArg::Ty(ty) => Ok(rty::GenericArg::Ty(self.refine_ty(ty)?)),
-            rustc::ty::GenericArg::Lifetime(re) => Ok(rty::GenericArg::Lifetime(*re)),
-            rustc::ty::GenericArg::Const(c) => Ok(rty::GenericArg::Const(c.clone())),
-        }
+    fn refine_alias_term(&self, alias_term: &ty::AliasTerm) -> QueryResult<rty::AliasTerm> {
+        let args = self.refine_generic_args(alias_term.def_id(), &alias_term.args)?;
+        Ok(rty::AliasTerm::new(alias_term.kind, args))
     }
 
-    pub(crate) fn refine_alias_ty(
-        &self,
-        alias_kind: &rustc::ty::AliasKind,
-        alias_ty: &rustc::ty::AliasTy,
-    ) -> QueryResult<rty::AliasTy> {
-        let def_id = alias_ty.def_id;
-        let args = self.iter_with_generics_of(def_id, &alias_ty.args, |param, arg| {
-            self.as_default().refine_generic_arg(param, arg)
-        })?;
-
-        let refine_args = self.refine_args_of(def_id, alias_kind)?;
-
-        let res = rty::AliasTy::new(def_id, args, refine_args);
-        Ok(res)
-    }
-
-    pub(crate) fn refine_ty(&self, ty: &rustc::ty::Ty) -> QueryResult<rty::Ty> {
-        let poly_ty = self.refine_poly_ty(ty)?;
-        let ty = match &poly_ty.vars()[..] {
-            [] => poly_ty.skip_binder().shift_out_escaping(1),
-            [rty::BoundVariableKind::Refine(s, _)] => {
-                if s.is_unit() {
-                    poly_ty.replace_bound_expr(&rty::Expr::unit())
-                } else if let Some(def_id) = s.is_unit_adt() {
-                    poly_ty.replace_bound_expr(&rty::Expr::unit_adt(def_id))
-                } else {
-                    rty::Ty::exists(poly_ty)
-                }
+    fn refine_alias_ty(&self, alias_ty: &ty::AliasTy) -> QueryResult<rty::AliasTy> {
+        match alias_ty.kind {
+            // Only opaque types carry refinement arguments
+            ty::AliasKind::Opaque { def_id } => {
+                let args = self.refine_generic_args(def_id, &alias_ty.args)?;
+                let refine_args = rty::RefineArgs::for_item(self.genv, def_id, |param, _| {
+                    let param = param.instantiate(self.genv.tcx(), &args, &[]);
+                    Ok(rty::Expr::hole(rty::HoleKind::Expr(param.sort)))
+                })?;
+                Ok(rty::AliasTy::new(alias_ty.kind, args, refine_args))
             }
-            _ => rty::Ty::exists(poly_ty),
-        };
-        Ok(ty)
-    }
-
-    fn refine_alias_kind(kind: &rustc::ty::AliasKind) -> rty::AliasKind {
-        match kind {
-            rustc::ty::AliasKind::Projection => rty::AliasKind::Projection,
-            rustc::ty::AliasKind::Opaque => rty::AliasKind::Opaque,
+            ty::AliasKind::Projection { def_id } | ty::AliasKind::Free { def_id } => {
+                let args = self.refine_generic_args(def_id, &alias_ty.args)?;
+                Ok(rty::AliasTy::new(alias_ty.kind, args, List::empty()))
+            }
         }
     }
 
-    pub fn refine_poly_ty(&self, ty: &rustc::ty::Ty) -> QueryResult<rty::PolyTy> {
+    pub fn refine_ty_or_base(&self, ty: &ty::Ty) -> QueryResult<rty::TyOrBase> {
         let bty = match ty.kind() {
-            rustc::ty::TyKind::Closure(did, args) => {
-                let args = args.as_closure();
-                let upvar_tys = args
+            ty::TyKind::Closure(did, args) => {
+                let no_panic = self.genv.no_panic(*did);
+                let closure_args = args.as_closure();
+                let upvar_tys = closure_args
                     .upvar_tys()
                     .iter()
-                    .map(|ty| self.refine_ty(ty))
+                    .map(|ty| ty.refine(self))
                     .try_collect()?;
-                rty::BaseTy::Closure(*did, upvar_tys)
+                rty::BaseTy::Closure(*did, upvar_tys, args.clone(), no_panic)
             }
-            rustc::ty::TyKind::Coroutine(did, args) => {
-                let args = args
-                    .iter()
-                    .map(|arg| self.refine_generic_arg_raw(arg))
+            ty::TyKind::Coroutine(did, args) => {
+                let coroutine_args = args.as_coroutine();
+                let resume_ty = coroutine_args.resume_ty().refine(self)?;
+                let upvar_tys = coroutine_args
+                    .upvar_tys()
+                    .map(|ty| ty.refine(self))
                     .try_collect()?;
-                rty::BaseTy::Coroutine(*did, args)
+                rty::BaseTy::Coroutine(*did, resume_ty, upvar_tys, args.clone())
             }
-            rustc::ty::TyKind::CoroutineWitness(did, args) => {
-                let args = args
-                    .iter()
-                    .map(|arg| self.refine_generic_arg_raw(arg))
-                    .try_collect()?;
-                rty::BaseTy::CoroutineWitness(*did, args)
+            ty::TyKind::CoroutineWitness(..) => {
+                bug!("implement when we know what this is");
             }
-            rustc::ty::TyKind::Never => rty::BaseTy::Never,
-            rustc::ty::TyKind::Ref(r, ty, mutbl) => {
-                rty::BaseTy::Ref(*r, self.refine_ty(ty)?, *mutbl)
-            }
-            rustc::ty::TyKind::Float(float_ty) => rty::BaseTy::Float(*float_ty),
-            rustc::ty::TyKind::Tuple(tys) => {
-                let tys = tys.iter().map(|ty| self.refine_ty(ty)).try_collect()?;
+            ty::TyKind::Never => rty::BaseTy::Never,
+            ty::TyKind::Ref(r, ty, mutbl) => rty::BaseTy::Ref(*r, ty.refine(self)?, *mutbl),
+            ty::TyKind::Float(float_ty) => rty::BaseTy::Float(*float_ty),
+            ty::TyKind::Tuple(tys) => {
+                let tys = tys.iter().map(|ty| ty.refine(self)).try_collect()?;
                 rty::BaseTy::Tuple(tys)
             }
-            rustc::ty::TyKind::Array(ty, len) => {
-                rty::BaseTy::Array(self.refine_ty(ty)?, len.clone())
-            }
-            rustc::ty::TyKind::Param(param_ty) => {
+            ty::TyKind::Array(ty, len) => rty::BaseTy::Array(ty.refine(self)?, len.clone()),
+            ty::TyKind::Param(param_ty) => {
                 match self.param(*param_ty)?.kind {
-                    rty::GenericParamDefKind::Type { .. } | rty::GenericParamDefKind::SplTy => {
-                        return Ok(rty::Binder::new(rty::Ty::param(*param_ty), List::empty()));
+                    rty::GenericParamDefKind::Type { .. } => {
+                        return Ok(rty::TyOrBase::Ty(rty::Ty::param(*param_ty)));
                     }
-                    rty::GenericParamDefKind::BaseTy => rty::BaseTy::Param(*param_ty),
-                    rty::GenericParamDefKind::Lifetime => bug!(),
-                    rty::GenericParamDefKind::Const { .. } => bug!(),
+                    rty::GenericParamDefKind::Base { .. } => rty::BaseTy::Param(*param_ty),
+                    rty::GenericParamDefKind::Lifetime | rty::GenericParamDefKind::Const { .. } => {
+                        bug!()
+                    }
                 }
             }
-            rustc::ty::TyKind::Adt(adt_def, args) => {
+            ty::TyKind::Adt(adt_def, args) => {
                 let adt_def = self.genv.adt_def(adt_def.did())?;
-                let args = self.iter_with_generics_of(adt_def.did(), args, |param, arg| {
-                    self.refine_generic_arg(param, arg)
-                })?;
+                let args = self.refine_generic_args(adt_def.did(), args)?;
                 rty::BaseTy::adt(adt_def, args)
             }
-            rustc::ty::TyKind::Alias(alias_kind, alias_ty) => {
-                let kind = Self::refine_alias_kind(alias_kind);
-                let alias_ty = self.refine_alias_ty(alias_kind, alias_ty)?;
-                return Ok(rty::Binder::new(rty::Ty::alias(kind, alias_ty), List::empty()));
+            ty::TyKind::FnDef(def_id, args) => {
+                let args = self.refine_generic_args(*def_id, args)?;
+                rty::BaseTy::fn_def(*def_id, args)
             }
-            rustc::ty::TyKind::Bool => rty::BaseTy::Bool,
-            rustc::ty::TyKind::Int(int_ty) => rty::BaseTy::Int(*int_ty),
-            rustc::ty::TyKind::Uint(uint_ty) => rty::BaseTy::Uint(*uint_ty),
-            rustc::ty::TyKind::Str => rty::BaseTy::Str,
-            rustc::ty::TyKind::Slice(ty) => rty::BaseTy::Slice(self.refine_ty(ty)?),
-            rustc::ty::TyKind::Char => rty::BaseTy::Char,
-            rustc::ty::TyKind::FnPtr(_) => todo!("refine_ty: FnSig"),
-            rustc::ty::TyKind::RawPtr(ty, mu) => {
-                rty::BaseTy::RawPtr(self.as_default().refine_ty(ty)?, *mu)
+            ty::TyKind::Alias(alias_ty) => {
+                let alias_ty = self.as_default().refine_alias_ty(alias_ty)?;
+                rty::BaseTy::Alias(alias_ty)
             }
+            ty::TyKind::Bool => rty::BaseTy::Bool,
+            ty::TyKind::Int(int_ty) => rty::BaseTy::Int(*int_ty),
+            ty::TyKind::Uint(uint_ty) => rty::BaseTy::Uint(*uint_ty),
+            ty::TyKind::Foreign(def_id) => rty::BaseTy::Foreign(*def_id),
+            ty::TyKind::Str => rty::BaseTy::Str,
+            ty::TyKind::Slice(ty) => rty::BaseTy::Slice(ty.refine(self)?),
+            ty::TyKind::Char => rty::BaseTy::Char,
+            ty::TyKind::FnPtr(poly_fn_sig) => {
+                rty::BaseTy::FnPtr(poly_fn_sig.refine(&self.as_default())?)
+            }
+            ty::TyKind::RawPtr(ty, mu) => rty::BaseTy::RawPtr(ty.refine(&self.as_default())?, *mu),
+            ty::TyKind::Dynamic(exi_preds, r) => {
+                let exi_preds = exi_preds
+                    .iter()
+                    .map(|pred| pred.refine(self))
+                    .try_collect()?;
+                rty::BaseTy::Dynamic(exi_preds, *r)
+            }
+            ty::TyKind::Pat => rty::BaseTy::Pat,
         };
-        Ok((self.refine)(bty))
+        Ok(rty::TyOrBase::Base((self.refine)(bty)))
     }
 
     fn as_default(&self) -> Self {
-        Refiner { refine: refine_default, ..*self }
+        Refiner { refine: refine_default, generics: self.generics.clone(), ..*self }
     }
 
     fn adt_def(&self, def_id: DefId) -> QueryResult<rty::AdtDef> {
@@ -373,65 +319,521 @@ impl<'a, 'tcx> Refiner<'a, 'tcx> {
         self.genv.generics_of(def_id)
     }
 
-    fn refine_args_of(
-        &self,
-        def_id: DefId,
-        alias_kind: &rustc::ty::AliasKind,
-    ) -> QueryResult<rty::RefineArgs> {
-        if let rustc::ty::AliasKind::Opaque = alias_kind {
-            self.genv
-                .refinement_generics_of(def_id)?
-                .collect_all_params(self.genv, |param| {
-                    rty::Expr::hole(rty::HoleKind::Expr(param.sort.clone()))
-                })
-        } else {
-            Ok(List::empty())
-        }
-    }
-
-    fn iter_with_generics_of(
-        &self,
-        def_id: DefId,
-        args: &[rustc::ty::GenericArg],
-        f: impl FnMut(&rty::GenericParamDef, &rustc::ty::GenericArg) -> QueryResult<rty::GenericArg>,
-    ) -> QueryResult<rty::GenericArgs> {
-        let generics = self.generics_of(def_id)?;
-        self.iter_with_generic_params(&generics, args, f)
-    }
-
-    fn iter_with_generic_params(
-        &self,
-        generics: &rty::Generics,
-        args: &[rustc::ty::GenericArg],
-        mut f: impl FnMut(&rty::GenericParamDef, &rustc::ty::GenericArg) -> QueryResult<rty::GenericArg>,
-    ) -> QueryResult<rty::GenericArgs> {
-        args.iter()
-            .enumerate()
-            .map(|(idx, arg)| {
-                let param = generics.param_at(idx, self.genv)?;
-                f(&param, arg)
-            })
-            .try_collect()
-    }
-
     fn param(&self, param_ty: ParamTy) -> QueryResult<rty::GenericParamDef> {
         self.generics.param_at(param_ty.index as usize, self.genv)
     }
 }
 
-fn refine_default(bty: rty::BaseTy) -> rty::Binder<rty::Ty> {
-    let sort = bty.sort();
-    rty::Binder::with_sort(rty::Ty::indexed(bty.shift_in_escaping(1), rty::Expr::nu()), sort)
+pub trait Refine {
+    type Output;
+
+    fn refine(&self, refiner: &Refiner) -> QueryResult<Self::Output>;
 }
 
-pub fn refine_bound_variables(
-    vars: &[rustc::ty::BoundVariableKind],
-) -> List<rty::BoundVariableKind> {
+impl Refine for ty::Ty {
+    type Output = rty::Ty;
+
+    fn refine(&self, refiner: &Refiner) -> QueryResult<rty::Ty> {
+        Ok(refiner.refine_ty_or_base(self)?.into_ty())
+    }
+}
+
+impl<T: Refine> Refine for ty::Binder<T> {
+    type Output = rty::Binder<T::Output>;
+
+    fn refine(&self, refiner: &Refiner) -> QueryResult<rty::Binder<T::Output>> {
+        let vars = refine_bound_variables(self.vars());
+        let inner = self.skip_binder_ref().refine(refiner)?;
+        Ok(rty::Binder::bind_with_vars(inner, vars))
+    }
+}
+
+impl Refine for ty::FnSig {
+    type Output = rty::FnSig;
+
+    // TODO(hof2)
+    fn refine(&self, refiner: &Refiner) -> QueryResult<rty::FnSig> {
+        let inputs = self
+            .inputs()
+            .iter()
+            .map(|ty| ty.refine(refiner))
+            .try_collect()?;
+        let ret = self.output().refine(refiner)?.shift_in_escaping(1);
+        let output = rty::Binder::bind_with_vars(rty::FnOutput::new(ret, vec![]), List::empty());
+        // TODO(hof2) make a hoister to hoist all the stuff out of the inputs,
+        // the hoister will have a list of all the variables it hoisted and the
+        // single hole for the "requires"; then we "fill" the hole with a KVAR
+        // and generate a PolyFnSig with the hoisted variables
+        // see `into_bb_env` in `type_env.rs` for an example.
+        Ok(rty::FnSig::new(self.safety, self.abi, List::empty(), inputs, output, Expr::ff(), true))
+    }
+}
+
+impl Refine for ty::Clause {
+    type Output = rty::Clause;
+
+    fn refine(&self, refiner: &Refiner) -> QueryResult<rty::Clause> {
+        Ok(rty::Clause { kind: self.kind.refine(refiner)? })
+    }
+}
+
+impl Refine for ty::TraitRef {
+    type Output = rty::TraitRef;
+
+    fn refine(&self, refiner: &Refiner) -> QueryResult<rty::TraitRef> {
+        Ok(rty::TraitRef {
+            def_id: self.def_id,
+            args: refiner.refine_generic_args(self.def_id, &self.args)?,
+        })
+    }
+}
+
+impl Refine for ty::ClauseKind {
+    type Output = rty::ClauseKind;
+
+    fn refine(&self, refiner: &Refiner) -> QueryResult<rty::ClauseKind> {
+        let kind = match self {
+            ty::ClauseKind::Trait(trait_pred) => {
+                let pred = rty::TraitPredicate { trait_ref: trait_pred.trait_ref.refine(refiner)? };
+                rty::ClauseKind::Trait(pred)
+            }
+            ty::ClauseKind::Projection(proj_pred) => {
+                let rty::TyOrBase::Base(term) = refiner.refine_ty_or_base(&proj_pred.term)? else {
+                    return Err(query_bug!(
+                        refiner.def_id,
+                        "sorry, we can't handle non-base associated types"
+                    ));
+                };
+                let pred = rty::ProjectionPredicate {
+                    projection_term: refiner.refine_alias_term(&proj_pred.projection_term)?,
+                    term,
+                };
+                rty::ClauseKind::Projection(pred)
+            }
+            ty::ClauseKind::RegionOutlives(pred) => {
+                let pred = rty::OutlivesPredicate(pred.0, pred.1);
+                rty::ClauseKind::RegionOutlives(pred)
+            }
+            ty::ClauseKind::TypeOutlives(pred) => {
+                let pred = rty::OutlivesPredicate(pred.0.refine(refiner)?, pred.1);
+                rty::ClauseKind::TypeOutlives(pred)
+            }
+            ty::ClauseKind::ConstArgHasType(const_, ty) => {
+                rty::ClauseKind::ConstArgHasType(const_.clone(), ty.refine(&refiner.as_default())?)
+            }
+            ty::ClauseKind::UnstableFeature(sym) => rty::ClauseKind::UnstableFeature(*sym),
+        };
+        Ok(kind)
+    }
+}
+
+impl Refine for ty::ExistentialPredicate {
+    type Output = rty::ExistentialPredicate;
+
+    fn refine(&self, refiner: &Refiner) -> QueryResult<Self::Output> {
+        let pred = match self {
+            ty::ExistentialPredicate::Trait(trait_ref) => {
+                rty::ExistentialPredicate::Trait(rty::ExistentialTraitRef {
+                    def_id: trait_ref.def_id,
+                    args: refiner.refine_existential_predicate_generic_args(
+                        trait_ref.def_id,
+                        &trait_ref.args,
+                    )?,
+                })
+            }
+            ty::ExistentialPredicate::Projection(projection) => {
+                let rty::TyOrBase::Base(term) = refiner.refine_ty_or_base(&projection.term)? else {
+                    return Err(query_bug!(
+                        refiner.def_id,
+                        "sorry, we can't handle non-base associated types"
+                    ));
+                };
+                rty::ExistentialPredicate::Projection(rty::ExistentialProjection {
+                    def_id: projection.def_id,
+                    args: refiner.refine_existential_predicate_generic_args(
+                        projection.def_id,
+                        &projection.args,
+                    )?,
+                    term,
+                })
+            }
+            ty::ExistentialPredicate::AutoTrait(def_id) => {
+                rty::ExistentialPredicate::AutoTrait(*def_id)
+            }
+        };
+        Ok(pred)
+    }
+}
+
+impl Refine for ty::GenericPredicates {
+    type Output = rty::GenericPredicates;
+
+    fn refine(&self, refiner: &Refiner) -> QueryResult<rty::GenericPredicates> {
+        Ok(rty::GenericPredicates {
+            parent: self.parent,
+            predicates: refiner.refine(&self.predicates)?,
+        })
+    }
+}
+
+impl<T> Refine for List<T>
+where
+    T: SliceInternable,
+    T: Refine<Output: SliceInternable>,
+{
+    type Output = rty::List<T::Output>;
+
+    fn refine(&self, refiner: &Refiner) -> QueryResult<rty::List<T::Output>> {
+        refiner.refine(&self[..])
+    }
+}
+
+impl<T> Refine for [T]
+where
+    T: Refine<Output: SliceInternable>,
+{
+    type Output = rty::List<T::Output>;
+
+    fn refine(&self, refiner: &Refiner) -> QueryResult<rty::List<T::Output>> {
+        self.iter().map(|t| refiner.refine(t)).try_collect()
+    }
+}
+
+fn refine_default(bty: rty::BaseTy) -> rty::SubsetTyCtor {
+    let sort = bty.sort();
+    let constr = rty::SubsetTy::trivial(bty.shift_in_escaping(1), rty::Expr::nu());
+    rty::Binder::bind_with_sort(constr, sort)
+}
+
+pub fn refine_bound_variables(vars: &[ty::BoundVariableKind]) -> List<rty::BoundVariableKind> {
     vars.iter()
         .map(|kind| {
             match kind {
-                rustc::ty::BoundVariableKind::Region(kind) => rty::BoundVariableKind::Region(*kind),
+                ty::BoundVariableKind::Region(kind) => rty::BoundVariableKind::Region(*kind),
             }
         })
         .collect()
+}
+
+impl rty::PolyFnSig {
+    pub fn add_weak_kvars(self, genv: GlobalEnv, def_id: DefId) -> QueryResult<Self> {
+        let refinement_generics = genv.refinement_generics_of(def_id)?;
+        let early_param_sorts: FxHashMap<Symbol, rty::Sort> = refinement_generics
+            .0
+            .own_params
+            .iter()
+            .map(|param| (param.name, param.sort.clone()))
+            .collect();
+        let early_vars = self
+            .early_params()
+            .into_iter()
+            .filter_map(|param| {
+                let sort = early_param_sorts.get(&param.name).unwrap().clone();
+                if is_weak_kvar_sort(&sort) {
+                    Some((rty::Var::EarlyParam(param), sort))
+                } else {
+                    None
+                }
+            })
+            .collect_vec();
+        let late_vars = make_vars_and_sorts_from_bound_vars(self.vars());
+        Ok(self.map(|fn_sig| {
+            let mut params = late_vars.into_iter().chain(early_vars).collect_vec();
+            let mut wkvar_inserter = WeakKVarInserter {
+                wkvar_map: WeakKvarMap::default(),
+                def_id,
+                kvid: rty::KVid::from(0_usize),
+                existential_params: Vec::new(),
+                params: params.clone(),
+            };
+            let requires_wkvar = make_weak_kvar(
+                &mut wkvar_inserter.wkvar_map,
+                def_id,
+                &mut wkvar_inserter.kvid,
+                Vec::new(),
+                params.clone(),
+            );
+            let inputs = fn_sig
+                .inputs
+                .iter()
+                .map(|input| wkvar_inserter.fold_ty(input))
+                .collect();
+            shift_in_vars(&mut params);
+            let output_binder_params = make_vars_and_sorts_from_bound_vars(fn_sig.output.vars());
+            params.extend(output_binder_params);
+            wkvar_inserter.params = params.clone();
+            let ensures = if !fn_sig.output.vars().is_empty()
+                && let Some(ensures_wkvar) = make_weak_kvar(
+                    &mut wkvar_inserter.wkvar_map,
+                    def_id,
+                    &mut wkvar_inserter.kvid,
+                    make_vars_and_sorts_from_bound_vars(fn_sig.output.vars()),
+                    params.clone(),
+                ) {
+                fn_sig
+                    .output
+                    .skip_binder_ref()
+                    .ensures
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(rty::Ensures::Pred(rty::Expr::wkvar(ensures_wkvar))))
+                    .collect()
+            } else {
+                fn_sig.output.skip_binder_ref().ensures.clone()
+            };
+            let output = fn_sig
+                .output
+                .map(|output| rty::FnOutput { ret: wkvar_inserter.fold_ty(&output.ret), ensures });
+            genv.feed_weak_kvars(def_id, wkvar_inserter.wkvar_map);
+
+            rty::FnSig {
+                abi: fn_sig.abi,
+                safety: fn_sig.safety,
+                inputs,
+                // NOTE(CK): Not sure whether we can avoid the clone.
+                requires: if let Some(requires_wkvar) = requires_wkvar {
+                    fn_sig
+                        .requires
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::once(rty::Expr::wkvar(requires_wkvar)))
+                        .collect()
+                } else {
+                    fn_sig.requires
+                },
+                output,
+                lifted: fn_sig.lifted,
+                no_panic: fn_sig.no_panic,
+            }
+        }))
+    }
+}
+
+struct WeakKVarInserter {
+    wkvar_map: WeakKvarMap,
+    def_id: DefId,
+    kvid: rty::KVid,
+    existential_params: Vec<Vec<(rty::Var, rty::Sort)>>,
+    params: Vec<(rty::Var, rty::Sort)>,
+}
+
+impl TypeFolder for WeakKVarInserter {
+    fn fold_ty(&mut self, ty: &rty::Ty) -> rty::Ty {
+        use rty::{Expr, Ty, TyKind::*};
+        match ty.kind() {
+            // This is the only recursive case where we need to update the params
+            // since we're going under a binder.
+            //
+            // We handle the shifting in and out explicitly rather than using
+            // the enter_binder and exit_binder methods because we immediately
+            // use the bound vars to make a weak kvar.
+            Exists(bound_ty) => {
+                for v in &mut self.existential_params {
+                    shift_in_vars(v);
+                }
+                shift_in_vars(&mut self.params);
+                let exist_params = make_vars_and_sorts_from_bound_vars(bound_ty.vars());
+                // Take all of the current existential params + the current params,
+                // AFTER shifting in.
+                let params = self
+                    .existential_params
+                    .iter()
+                    .flatten()
+                    .chain(self.params.iter())
+                    .cloned()
+                    .collect();
+                // We pass the params immediately under this binder as the self args.
+                //
+                // The purpose of self args is to ensure that we don't have duplication
+                // of suggestions.
+                //
+                // Suppose after we add weak kvars we have the type
+                //
+                //     fn ({exists v0. Vec<i32>[v0] | $wk1[v0]()}) requires $wk0[]()
+                //
+                // If we are looking to instantiate a weak kvar to the
+                // expression `2 > 1` (for some reason), we can validly put it
+                // in both $wk0 and $wk1. But the self arg ensures that we don't
+                // put it in $wk1, since it requires the expression contain one
+                // of its self args (in this case, just `v0`).
+                let wkvar = make_weak_kvar(
+                    &mut self.wkvar_map,
+                    self.def_id,
+                    &mut self.kvid,
+                    exist_params.clone(),
+                    params,
+                );
+                // Now we add the params for future weak kvars.
+                self.existential_params.push(exist_params);
+                let new_ty = bound_ty.skip_binder_ref().super_fold_with(self);
+                self.existential_params.pop();
+                for v in &mut self.existential_params {
+                    shift_out_vars(v);
+                }
+                shift_out_vars(&mut self.params);
+                Ty::exists(rty::Binder::bind_with_vars(
+                    if let Some(wkvar) = wkvar {
+                        Ty::constr(Expr::wkvar(wkvar), new_ty)
+                    } else {
+                        new_ty
+                    },
+                    bound_ty.vars().clone(),
+                ))
+            }
+            _ => ty.super_fold_with(self),
+        }
+    }
+
+    fn fold_bty(&mut self, bty: &rty::BaseTy) -> rty::BaseTy {
+        use rty::{BaseTy, Expr, GenericArg};
+        match bty {
+            BaseTy::Adt(adt_def, args) => {
+                let new_args = args
+                    .iter()
+                    .map(|arg| {
+                        match arg {
+                            GenericArg::Base(subset_ty) => {
+                                for v in &mut self.existential_params {
+                                    shift_in_vars(v);
+                                }
+                                shift_in_vars(&mut self.params);
+                                let exist_params =
+                                    make_vars_and_sorts_from_bound_vars(subset_ty.vars());
+                                // Take all of the current existential params + the current params,
+                                // AFTER shifting in.
+                                let params = self
+                                    .existential_params
+                                    .iter()
+                                    .flatten()
+                                    .chain(self.params.iter())
+                                    .cloned()
+                                    .collect();
+                                // We pass the params immediately under this binder as the self args.
+                                // see the TyKind::Exists case.
+                                let wkvar = make_weak_kvar(
+                                    &mut self.wkvar_map,
+                                    self.def_id,
+                                    &mut self.kvid,
+                                    exist_params.clone(),
+                                    params,
+                                );
+                                // Now we add the params for future weak kvars.
+                                self.existential_params.push(exist_params);
+                                let new_ty = subset_ty.skip_binder_ref().super_fold_with(self);
+                                let new_ty_maybe_with_wkvar = if let Some(wkvar) = wkvar {
+                                    new_ty.strengthen(Expr::wkvar(wkvar))
+                                } else {
+                                    new_ty
+                                };
+                                self.existential_params.pop();
+                                for v in &mut self.existential_params {
+                                    shift_out_vars(v);
+                                }
+                                shift_out_vars(&mut self.params);
+                                GenericArg::Base(rty::Binder::bind_with_vars(
+                                    new_ty_maybe_with_wkvar,
+                                    subset_ty.vars().clone(),
+                                ))
+                            }
+                            _ => arg.fold_with(self),
+                        }
+                    })
+                    .collect();
+                BaseTy::Adt(adt_def.clone(), new_args)
+            }
+            // For these specific btys, we will recur and add wkvars
+            BaseTy::Ref(..) | BaseTy::Tuple(..) | BaseTy::Array(..) | BaseTy::Slice(..) => {
+                bty.super_fold_with(self)
+            }
+            // By default we will not recur on the bty to add wkvars
+            _ => bty.clone(),
+        }
+    }
+
+    fn fold_expr(&mut self, expr: &Expr) -> Expr {
+        expr.clone()
+    }
+
+    fn fold_sort(&mut self, sort: &rty::Sort) -> rty::Sort {
+        sort.clone()
+    }
+}
+
+/// NOTE(CK):
+///   * Skips params (we don't presently handle polymorphism, though even if we did,
+///     I'm not sure that we need to pass params to the weak kvars).
+///   * Skips locs because we can't encode those.
+///   * Skips aliases: a projection can normalize to a unit sort at a call-site,
+///     while the weak kvar's declaration would still encode it as an integer.
+///   * Skips unit + unit adts because they otherwise get encoded as a 0 tuple
+///     to fixpoint because we use them in the args to a weak kvar, which
+///     we don't want to do.
+fn is_weak_kvar_sort(sort: &rty::Sort) -> bool {
+    !sort.is_param()
+        && !matches!(sort, rty::Sort::Alias(..))
+        && !sort.is_loc()
+        && !sort.is_unit()
+        && sort.is_unit_adt().is_none()
+}
+
+fn make_vars_and_sorts_from_bound_vars<'a, I, II>(vars: I) -> Vec<(rty::Var, rty::Sort)>
+where
+    I: IntoIterator<IntoIter = II>,
+    II: DoubleEndedIterator<Item = &'a rty::BoundVariableKind>,
+{
+    vars.into_iter()
+        .enumerate()
+        .filter_map(|(i, var_kind)| {
+            if let rty::BoundVariableKind::Refine(sort, _, reft_kind) = var_kind
+                && is_weak_kvar_sort(sort)
+            {
+                let bound_reft = rty::BoundReft { var: rty::BoundVar::from(i), kind: *reft_kind };
+                Some((rty::Var::Bound(INNERMOST, bound_reft), sort.clone()))
+            } else {
+                None
+            }
+        })
+        .collect_vec()
+}
+
+// TODO: Use a Vec<Vec<_>> solution, per Nico.
+// This is a sort of annoying rearchitecture, but nothing impossible.
+fn shift_in_vars(vars: &mut [(rty::Var, rty::Sort)]) {
+    for (var, _) in vars.iter_mut() {
+        *var = var.shift_in(1);
+    }
+}
+
+fn shift_out_vars(vars: &mut [(rty::Var, rty::Sort)]) {
+    for (var, _) in vars.iter_mut() {
+        *var = var.shift_out(1);
+    }
+}
+
+// TODO: Don't make a weak kvar if the self_args is empty if there's a weak kvar
+//        that's been created before it with a superset of its params.
+fn make_weak_kvar(
+    wkvar_map: &mut WeakKvarMap,
+    def_id: DefId,
+    kvid: &mut rty::KVid,
+    self_args: Vec<(rty::Var, rty::Sort)>,
+    params: Vec<(rty::Var, rty::Sort)>,
+) -> Option<rty::WKVar> {
+    if self_args.is_empty() && params.is_empty() {
+        return None;
+    }
+    let num_self_args = self_args.len();
+    let (args, sorts): (Vec<rty::Var>, Vec<rty::Sort>) =
+        self_args.into_iter().chain(params).unzip();
+    let arg_exprs = args.into_iter().map(rty::Expr::var).collect();
+    // We don't have any solutions because these weak kvars are being generated
+    // (solutions only come from user annotations).
+    wkvar_map.insert(kvid.as_u32(), WeakKvarInfo { solutions: vec![], sorts });
+    let ret = rty::WKVar {
+        wkvid: rty::WKVid::new(def_id, *kvid),
+        self_args: num_self_args,
+        args: arg_exprs,
+    };
+    *kvid += 1;
+    Some(ret)
 }

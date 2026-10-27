@@ -1,0 +1,24 @@
+[package]
+name = "tests"
+version = "0.1.0"
+
+edition.workspace = true
+
+[lib]
+doctest = false
+test = false
+
+[dependencies]
+flux-dev.workspace = true
+flux-sysroot.workspace = true
+
+[dev-dependencies]
+itertools.workspace = true
+
+compiletest_rs = { version = "0.11", features = ["tmp"] }
+
+[package.metadata.rust-analyzer]
+rustc_private = true
+
+[lints]
+workspace = true

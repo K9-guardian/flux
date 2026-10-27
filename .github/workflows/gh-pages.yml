@@ -3,10 +3,12 @@ name: gh-pages
 on:
   push:
     branches: [main]
-    paths: book/**
   pull_request:
     branches: [main]
-    paths: book/**
+
+concurrency:
+  group: ${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -17,11 +19,13 @@ jobs:
 
       - name: Install mdBook
         uses: peaceiris/actions-mdbook@v1.2.0
+        with:
+          mdbook-version: "0.4.48"
 
       - run: mdbook build book
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2.2.1
+        uses: Swatinem/rust-cache@v2.8.0
 
       - run: cargo xtask doc && mv target/doc book/book
 

@@ -1,110 +1,260 @@
-mod ast;
-mod extern_spec;
+#[cfg(not(flux_sysroot))]
+use attr_dummy as attr_impl;
+#[cfg(flux_sysroot)]
+use attr_sysroot as attr_impl;
+use proc_macro::TokenStream;
 
-use proc_macro2::{Ident, TokenStream, TokenTree};
-use quote::{quote, quote_spanned, ToTokens};
-use syn::{parse_quote, spanned::Spanned, Attribute, ItemEnum, ItemStruct};
-
-pub fn extern_spec(attr: TokenStream, tokens: TokenStream) -> TokenStream {
-    extern_spec::transform_extern_spec(attr, tokens).unwrap_or_else(|err| err.to_compile_error())
+#[proc_macro_attribute]
+pub fn alias(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::alias(attr, tokens)
 }
 
-pub fn flux_tool_item_attr(name: &str, attr: TokenStream, item: TokenStream) -> TokenStream {
-    // I don't really know what I'm doing here, but spanning the quote with the item's span seems
-    // to behave correctly.
-    let span = item.span();
-    let name = TokenTree::Ident(Ident::new(name, span));
-    if attr.is_empty() {
-        quote_spanned! {span=>
-            #[flux_tool::#name]
-            #item
-        }
-    } else {
-        quote_spanned! {span=>
-            #[flux_tool::#name(#attr)]
-            #item
-        }
-    }
+#[proc_macro_attribute]
+pub fn sig(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::sig(attr, tokens)
 }
 
-pub fn refined_by(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let span = item.span();
-    let mut item = match syn::parse2::<syn::Item>(item) {
-        Ok(item) => item,
-        Err(err) => return err.to_compile_error(),
-    };
-
-    match &mut item {
-        syn::Item::Enum(item_enum) => refined_by_enum(item_enum),
-        syn::Item::Struct(item_struct) => refined_by_struct(item_struct),
-        _ => return syn::Error::new(span, "expected struct or enum").to_compile_error(),
-    }
-
-    if cfg!(flux_sysroot) {
-        quote_spanned! {span=>
-            #[flux_tool::refined_by(#attr)]
-            #item
-        }
-    } else {
-        item.to_token_stream()
-    }
+#[proc_macro_attribute]
+pub fn spec(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::spec(attr, tokens)
 }
 
-fn refined_by_enum(item_enum: &mut ItemEnum) {
-    for variant in &mut item_enum.variants {
-        flux_tool_attrs(&mut variant.attrs, &["variant"]);
-    }
+#[proc_macro_attribute]
+pub fn specs(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::specs(attr, tokens)
 }
 
-fn refined_by_struct(item_struct: &mut ItemStruct) {
-    for field in &mut item_struct.fields {
-        flux_tool_attrs(&mut field.attrs, &["field"]);
-    }
+#[proc_macro_attribute]
+pub fn qualifiers(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::qualifiers(attr, tokens)
 }
 
-fn flux_tool_attrs(attrs: &mut Vec<Attribute>, names: &[&str]) {
-    let mut j = 0;
-    for i in 0..attrs.len() {
-        if cfg!(flux_sysroot) {
-            if path_is_one_of(attrs[i].path(), names) {
-                flux_tool_attr(&mut attrs[i]);
-                attrs.swap(i, j);
-                j += 1;
-            }
-        } else if !path_is_one_of(attrs[i].path(), names) {
-            attrs.swap(i, j);
-            j += 1;
-        }
-    }
-    if !cfg!(flux_sysroot) {
-        attrs.truncate(j);
-    }
+#[proc_macro_attribute]
+pub fn reveal(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::reveal(attr, tokens)
 }
 
-fn path_is_one_of(path: &syn::Path, idents: &[&str]) -> bool {
-    idents.iter().any(|ident| path.is_ident(ident))
+#[proc_macro_attribute]
+pub fn hide(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::hide(attr, tokens)
 }
 
-fn flux_tool_attr(attr: &mut Attribute) {
-    let path = match &mut attr.meta {
-        syn::Meta::Path(path) => path,
-        syn::Meta::List(metalist) => &mut metalist.path,
-        syn::Meta::NameValue(namevalue) => &mut namevalue.path,
-    };
-    *path = parse_quote!(flux_tool::#path);
+#[proc_macro_attribute]
+pub fn refined_by(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::refined_by(attr, tokens)
 }
 
+#[proc_macro_attribute]
+pub fn invariant(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::invariant(attr, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn constant(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::constant(attr, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn opaque(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::opaque(attr, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn reflect(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::reflect(attr, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn opts(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::opts(attr, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn trusted(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::trusted(attr, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn trusted_impl(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::trusted_impl(attr, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn trusted_derive(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::trusted_derive(attr, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn proven_externally(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::proven_externally(attr, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn generics(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::generics(attr, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn assoc(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::assoc(attr, tokens)
+}
+
+#[proc_macro]
 pub fn flux(tokens: TokenStream) -> TokenStream {
-    syn::parse2::<ast::Items>(tokens)
-        .map_or_else(|err| err.to_compile_error(), ToTokens::into_token_stream)
+    flux_attrs_impl::flux(tokens.into()).into()
 }
 
+#[proc_macro]
 pub fn defs(tokens: TokenStream) -> TokenStream {
-    quote! {
-        mod flux_defs {
-            #![flux::defs {
-                #tokens
-            }]
-        }
+    attr_impl::defs(tokens)
+}
+
+#[proc_macro_attribute]
+pub fn extern_spec(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::extern_spec(attrs, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn ignore(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::ignore(attrs, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn should_fail(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::should_fail(attrs, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn no_panic(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::no_panic(attrs, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn no_panic_if(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::no_panic_if(attrs, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn no_suggestions(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::no_suggestions(attrs, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn reft(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::reft(attrs, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn assume_parametric(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::assume_parametric(attrs, tokens)
+}
+
+#[cfg(flux_sysroot)]
+mod attr_sysroot {
+    use super::*;
+
+    pub fn extern_spec(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+        flux_attrs_impl::extern_spec(attr.into(), tokens.into()).into()
     }
+
+    pub fn refined_by(attr: TokenStream, item: TokenStream) -> TokenStream {
+        flux_attrs_impl::refined_by(attr.into(), item.into()).into()
+    }
+
+    pub fn defs(tokens: TokenStream) -> TokenStream {
+        flux_attrs_impl::defs(tokens.into()).into()
+    }
+
+    macro_rules! flux_tool_attrs {
+        ($($name:ident),+ $(,)?) => {
+            $(
+            pub fn $name(attr: TokenStream, item: TokenStream) -> TokenStream {
+                flux_attrs_impl::flux_tool_item_attr(stringify!($name), attr.into(), item.into()).into()
+            }
+            )*
+        };
+    }
+
+    flux_tool_attrs!(
+        alias,
+        spec,
+        specs,
+        sig,
+        qualifiers,
+        reveal,
+        hide,
+        constant,
+        invariant,
+        opaque,
+        reflect,
+        opts,
+        trusted,
+        trusted_impl,
+        trusted_derive,
+        proven_externally,
+        generics,
+        assoc,
+        ignore,
+        should_fail,
+        reft,
+        no_panic,
+        no_panic_if,
+        assume_parametric,
+        no_suggestions,
+    );
+}
+
+#[cfg(not(flux_sysroot))]
+mod attr_dummy {
+    use super::*;
+
+    pub fn refined_by(attr: TokenStream, item: TokenStream) -> TokenStream {
+        flux_attrs_impl::refined_by(attr.into(), item.into()).into()
+    }
+
+    pub fn defs(_tokens: TokenStream) -> TokenStream {
+        TokenStream::new()
+    }
+
+    pub fn extern_spec(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
+        flux_attrs_impl::extern_spec_doc(attrs.into(), tokens.into()).into()
+    }
+
+    macro_rules! no_op {
+        ($($name:ident),+ $(,)?) => {
+            $(
+            pub fn $name(_attr: TokenStream, item: TokenStream) -> TokenStream {
+                item
+            }
+            )+
+        };
+    }
+
+    no_op!(
+        alias,
+        spec,
+        specs,
+        sig,
+        qualifiers,
+        reveal,
+        hide,
+        invariant,
+        constant,
+        opaque,
+        reflect,
+        opts,
+        trusted,
+        trusted_impl,
+        trusted_derive,
+        proven_externally,
+        generics,
+        assoc,
+        ignore,
+        should_fail,
+        no_panic,
+        no_panic_if,
+        no_suggestions,
+        reft,
+        assume_parametric,
+    );
 }

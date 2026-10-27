@@ -1,59 +1,87 @@
-use std::{fs::File, path::PathBuf};
+use std::{
+    fs::{self, File},
+    io::BufWriter,
+    path::Path,
+};
 
 use flux_config as config;
 use rustc_hash::FxHashMap;
 
-pub struct QueryCache {
-    entries: FxHashMap<String, u64>,
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct QueryVal<R> {
+    constr_hash: u64,
+    result: R,
 }
 
-impl Default for QueryCache {
+pub struct QueryCache<R> {
+    entries: FxHashMap<String, QueryVal<R>>,
+}
+
+impl<R> Default for QueryCache<R> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl QueryCache {
+impl<R> QueryCache<R> {
     pub fn new() -> Self {
         QueryCache { entries: FxHashMap::default() }
     }
 
-    pub fn insert(&mut self, key: String, constr_hash: u64) {
-        self.entries.insert(key, constr_hash);
+    pub fn insert(&mut self, key: String, constr_hash: u64, result: R) {
+        let val = QueryVal { constr_hash, result };
+        self.entries.insert(key, val);
     }
 
-    pub fn is_safe(&self, key: &String, constr_hash: u64) -> bool {
-        config::is_cache_enabled() && self.entries.get(key).map_or(false, |h| *h == constr_hash)
+    pub fn lookup(&self, key: &String, constr_hash: u64) -> Option<&R> {
+        let val = self.entries.get(key)?;
+        if val.constr_hash == constr_hash { Some(&val.result) } else { None }
     }
 
-    fn path() -> Result<PathBuf, std::io::Error> {
-        if config::is_cache_enabled() {
-            let path = config::cache_path();
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-                return Ok(path);
-            }
+    /// Look up a result by key only (no hash validation).
+    pub fn lookup_by_key(&self, key: &str) -> Option<&R> {
+        self.entries.get(key).map(|e| &e.result)
+    }
+
+    /// Mutate a cached result by key only (no hash validation).
+    pub fn update_result_by_key(&mut self, key: &str, f: impl FnOnce(&mut R)) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            f(&mut entry.result);
         }
+    }
+
+    fn path() -> Result<&'static Path, std::io::Error> {
+        if let Some(path) = config::cache_path()
+            && let Some(parent) = path.parent()
+        {
+            std::fs::create_dir_all(parent)?;
+            return Ok(path);
+        }
+
         Err(Self::no_cache_err())
     }
 
     fn no_cache_err() -> std::io::Error {
-        std::io::Error::new(std::io::ErrorKind::Other, "cache not enabled")
+        std::io::Error::other("cache not enabled")
     }
+}
 
+impl<R: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned> QueryCache<R> {
     pub fn save(&self) -> Result<(), std::io::Error> {
         let path = Self::path()?;
-        let mut file = File::create(path).unwrap();
-        serde_json::to_writer(&mut file, &self.entries).unwrap();
+        let file = File::create(path).unwrap();
+        serde_json::to_writer(BufWriter::new(file), &self.entries).unwrap();
         Ok(())
     }
 
     pub fn load() -> Self {
-        if let Ok(path) = Self::path() {
-            if let Ok(file) = File::open(path) {
-                if let Ok(entries) = serde_json::from_reader(file) {
-                    return QueryCache { entries };
-                }
+        let path = Self::path();
+        if let Ok(path) = path
+            && let Ok(data) = fs::read(path)
+        {
+            let entries = serde_json::from_slice(&data);
+            if let Ok(entries) = entries {
+                return QueryCache { entries };
             }
         }
         Self::default()

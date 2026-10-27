@@ -1,188 +1,584 @@
-use std::{borrow::Borrow, rc::Rc};
+use std::{
+    alloc,
+    cell::RefCell,
+    path::{Path, PathBuf},
+    ptr,
+    rc::Rc,
+    slice,
+};
 
+use flux_arc_interner::List;
+use flux_common::{bug, result::ErrorEmitter};
+use flux_config::{self as config, IncludePattern};
 use flux_errors::FluxSession;
-use rustc_hash::FxHashSet;
+use flux_rustc_bridge::{self, lowering::Lower, mir, ty};
+use flux_syntax::symbols::sym;
+use rustc_attr_ir::LangItem;
+use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir::{
     def::DefKind,
-    def_id::{DefId, LocalDefId},
-    LangItem,
+    def_id::{CrateNum, DefId, LocalDefId},
 };
-use rustc_middle::ty::{TyCtxt, Variance};
-pub use rustc_span::{symbol::Ident, Symbol};
+use rustc_middle::{
+    query::IntoQueryKey,
+    ty::{TyCtxt, Variance},
+};
+use rustc_span::{FileName, Span};
+pub use rustc_span::{Symbol, symbol::Ident};
+use tempfile::TempDir;
 
 use crate::{
+    PanicReason, PanicSpec,
+    call_graph::NodeKey,
     cstore::CrateStoreDyn,
-    fhir::{self, FluxLocalDefId, VariantIdx},
-    intern::List,
-    queries::{Providers, Queries, QueryResult},
-    rty::{self, fold::TypeFoldable, normalize::Defns, refining::Refiner},
-    rustc::{self, ty},
+    def_id::{FluxDefId, FluxLocalDefId, MaybeExternId, ResolvedDefId},
+    fhir::{self, VariantIdx},
+    queries::{DispatchKey, Providers, Queries, QueryErr, QueryResult},
+    query_bug,
+    rty::{
+        self, QualifierKind,
+        refining::{Refine as _, Refiner},
+    },
 };
 
-pub struct GlobalEnv<'sess, 'tcx> {
-    pub tcx: TyCtxt<'tcx>,
-    pub sess: &'sess FluxSession,
-    cstore: Box<CrateStoreDyn>,
-    map: fhir::Map,
-    queries: Queries<'tcx>,
+#[derive(Clone, Copy)]
+pub struct GlobalEnv<'genv, 'tcx> {
+    inner: &'genv GlobalEnvInner<'genv, 'tcx>,
 }
 
-impl<'sess, 'tcx> GlobalEnv<'sess, 'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, sess: &'sess FluxSession, cstore: Box<CrateStoreDyn>) -> Self {
-        GlobalEnv { tcx, sess, cstore, map: fhir::Map::new(), queries: Queries::default() }
+pub struct WeakKvarInfo {
+    /// Solutions (if provided as ground truth annotations). Each soution is
+    /// part of a conjunction that constitutes the full ground truth.
+    pub solutions: Vec<rty::Binder<rty::Expr>>,
+    /// The sorts of the weak kvar in the order in which they appear in the
+    /// arguments.
+    pub sorts: Vec<rty::Sort>,
+}
+pub type WeakKvarMap = UnordMap<u32, WeakKvarInfo>;
+
+struct GlobalEnvInner<'genv, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    sess: &'genv FluxSession,
+    arena: &'genv fhir::Arena,
+    cstore: Box<CrateStoreDyn<'tcx>>,
+    queries: Queries<'genv, 'tcx>,
+    tempdir: TempDir,
+    weak_kvars: RefCell<UnordMap<DefId, Rc<WeakKvarMap>>>,
+}
+
+impl<'tcx> GlobalEnv<'_, 'tcx> {
+    pub fn enter<'a, R>(
+        tcx: TyCtxt<'tcx>,
+        sess: &'a FluxSession,
+        cstore: Box<CrateStoreDyn<'tcx>>,
+        arena: &'a fhir::Arena,
+        providers: Providers,
+        f: impl for<'genv> FnOnce(GlobalEnv<'genv, 'tcx>) -> R,
+    ) -> R {
+        // The tempdir must be in the same partition as the target directory so we can `fs::rename`
+        // files in it.
+        let tempdir = TempDir::new_in(lean_parent_dir(tcx)).unwrap();
+        let queries = Queries::new(providers);
+        let inner = GlobalEnvInner {
+            tcx,
+            sess,
+            cstore,
+            arena,
+            queries,
+            tempdir,
+            weak_kvars: Default::default(),
+        };
+        f(GlobalEnv { inner: &inner })
+    }
+}
+
+impl<'genv, 'tcx> GlobalEnv<'genv, 'tcx> {
+    pub fn queried(self, def_id: DefId) -> bool {
+        self.inner.queries.queried(def_id)
     }
 
-    pub fn providers(&mut self) -> &mut Providers {
-        &mut self.queries.providers
+    /// Runs a query only if the given key's `DefId` was previously queried during checking.
+    ///
+    /// During checking, we track all items transitively reached from explicitly included items.
+    /// This method is used during metadata encoding to avoid triggering queries for items that
+    /// were not reached. If the item was not previously queried, returns [`QueryErr::Ignored`].
+    pub fn run_query_if_reached<K: DispatchKey, R>(
+        self,
+        key: K,
+        query: impl FnOnce(Self, K) -> QueryResult<R>,
+    ) -> QueryResult<R> {
+        if !self.inner.queries.queried(key.def_id()) {
+            return Err(QueryErr::NotIncluded { def_id: key.def_id() });
+        }
+
+        query(self, key)
     }
 
-    pub fn map(&self) -> &fhir::Map {
-        &self.map
+    pub fn tcx(self) -> TyCtxt<'tcx> {
+        self.inner.tcx
     }
 
-    pub fn map_mut(&mut self) -> &mut fhir::Map {
-        &mut self.map
+    pub fn sess(self) -> &'genv FluxSession {
+        self.inner.sess
     }
 
-    pub fn defns(&self) -> QueryResult<&Defns> {
-        self.queries.defns(self)
+    pub fn collect_specs(self) -> &'genv crate::Specs {
+        self.inner.queries.collect_specs(self)
     }
 
-    pub fn qualifiers(
-        &self,
+    pub fn resolve_crate(self) -> &'genv crate::ResolverOutput {
+        self.inner.queries.resolve_crate(self)
+    }
+
+    /// Akin to `rustc_middle::ty::TyCtxt::module_children` but for flux items (`defs!` and
+    /// sort declarations) defined directly in a module.
+    pub fn flux_module_children(self, def_id: DefId) -> &'genv [fhir::FluxModChild] {
+        self.inner.queries.flux_module_children(self, def_id)
+    }
+
+    /// Parent directory of the Lean project.
+    pub fn lean_parent_dir(self) -> PathBuf {
+        lean_parent_dir(self.tcx())
+    }
+
+    pub fn temp_dir(self) -> &'genv TempDir {
+        &self.inner.tempdir
+    }
+
+    pub fn desugar(self, def_id: LocalDefId) -> QueryResult<fhir::Node<'genv>> {
+        self.inner.queries.desugar(self, def_id)
+    }
+
+    pub fn fhir_attr_map(self, def_id: LocalDefId) -> fhir::AttrMap<'genv> {
+        self.inner.queries.fhir_attr_map(self, def_id)
+    }
+
+    pub fn fhir_crate(self) -> &'genv fhir::FluxItems<'genv> {
+        self.inner.queries.fhir_crate(self)
+    }
+
+    pub fn alloc<T>(&self, val: T) -> &'genv T {
+        self.inner.arena.alloc(val)
+    }
+
+    pub fn alloc_slice<T: Copy>(self, slice: &[T]) -> &'genv [T] {
+        self.inner.arena.alloc_slice_copy(slice)
+    }
+
+    pub fn alloc_slice_fill_iter<T, I>(self, it: I) -> &'genv [T]
+    where
+        I: IntoIterator<Item = T>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        self.inner.arena.alloc_slice_fill_iter(it)
+    }
+
+    pub fn def_kind(&self, def_id: impl IntoQueryKey<DefId>) -> DefKind {
+        self.tcx().def_kind(def_id.into_query_key())
+    }
+
+    /// Allocates space to store `cap` elements of type `T`.
+    ///
+    /// The elements are initialized using the supplied iterator. At most `cap` elements will be
+    /// retrieved from the iterator. If the iterator yields fewer than `cap` elements, the returned
+    /// slice will be of length less than the allocated capacity.
+    ///
+    /// ## Panics
+    ///
+    /// Panics if reserving space for the slice fails.
+    pub fn alloc_slice_with_capacity<T, I>(self, cap: usize, it: I) -> &'genv [T]
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let layout = alloc::Layout::array::<T>(cap).unwrap_or_else(|_| bug!("out of memory"));
+        let dst = self.inner.arena.alloc_layout(layout).cast::<T>();
+        unsafe {
+            let mut len = 0;
+            for (i, v) in it.into_iter().take(cap).enumerate() {
+                len += 1;
+                ptr::write(dst.as_ptr().add(i), v);
+            }
+
+            slice::from_raw_parts(dst.as_ptr(), len)
+        }
+    }
+
+    pub fn call_graph(self) -> &'genv crate::call_graph::CallGraph<'tcx> {
+        self.inner.queries.call_graph(self)
+    }
+
+    /// The inferred [`PanicSpec`] for the node `key`, looked up in the local crate's
+    /// `NodeKey`-keyed map. Missing entries default to `MightPanic(NotInCallGraph)`.
+    pub fn inferred_no_panic_key(self, key: NodeKey<'tcx>) -> PanicSpec {
+        self.inferred_no_panic_local()
+            .get(&key)
+            .copied()
+            .unwrap_or(PanicSpec::MightPanic(PanicReason::NotInCallGraph))
+    }
+
+    /// The local crate's full `NodeKey`-keyed no-panic map (used by metadata encoding).
+    pub fn inferred_no_panic_local(self) -> Rc<UnordMap<NodeKey<'tcx>, PanicSpec>> {
+        self.inner.queries.inferred_no_panic(self)
+    }
+
+    /// Looks up the inferred [`PanicSpec`] for a node `key` defined in an *external* crate, from
+    /// that crate's serialized metadata table. Tries the exact key first (so a serialized
+    /// [`Mono`](NodeKey::Mono) is used when present), then for a monomorphization falls back to the
+    /// source [`Item`](NodeKey::Item) (covering instantiations the external crate could never have
+    /// analyzed, e.g. at a local type), then to `MightPanic`.
+    pub fn inferred_no_panic_external(self, key: NodeKey<'tcx>) -> PanicSpec {
+        let table = self.cstore().inferred_no_panic(key.def_id().krate);
+        if let Some(&spec) = table.get(&key) {
+            return spec;
+        }
+        if let NodeKey::Mono(instance) = key
+            && let Some(&spec) = table.get(&NodeKey::Item(instance.def_id()))
+        {
+            return spec;
+        }
+        PanicSpec::MightPanic(PanicReason::NotInCallGraph)
+    }
+
+    /// The body of a spec function after inlining all or some of the spec functions it
+    /// (transitively) calls. Whether a spec function is inlined is decided by
+    /// [`GlobalEnv::should_inline_fun`] in the current session.
+    pub fn inlined_body(self, did: FluxDefId) -> rty::Binder<rty::Expr> {
+        self.inner.queries.inlined_body(self, did)
+    }
+
+    pub fn spec_func(self, did: FluxDefId) -> rty::SpecFunc {
+        self.spec_funcs(did.krate()).get(did.index()).clone()
+    }
+
+    /// The rank of a spec function in the topological order of the spec functions of its crate
+    pub fn spec_func_rank(self, did: FluxDefId) -> usize {
+        self.spec_funcs(did.krate()).rank(did.index())
+    }
+
+    /// All the spec functions of a crate in topological order
+    pub fn spec_funcs(self, krate: CrateNum) -> Rc<rty::SpecFuncs> {
+        self.inner.queries.spec_funcs(self, krate)
+    }
+
+    pub fn prim_rel_for(self, op: &rty::BinOp) -> QueryResult<Option<&'genv rty::PrimRel>> {
+        Ok(self.inner.queries.prim_rel(self)?.get(op))
+    }
+
+    pub fn qualifiers(self) -> QueryResult<&'genv [rty::Qualifier]> {
+        self.inner.queries.qualifiers(self)
+    }
+
+    /// Return all the (global) axioms defined in the local crate.
+    pub fn axioms(self) -> QueryResult<&'genv [rty::Axiom]> {
+        self.inner.queries.axioms(self)
+    }
+
+    /// Return all the qualifiers that apply to an item, including both global and local qualifiers.
+    pub fn qualifiers_for(
+        self,
         did: LocalDefId,
-    ) -> QueryResult<impl Iterator<Item = &rty::Qualifier>> {
-        let names: FxHashSet<Symbol> = self.map().get_fn_quals(did).map(|qual| qual.name).collect();
-        Ok(self
-            .queries
-            .qualifiers(self)?
+    ) -> QueryResult<impl Iterator<Item = &'genv rty::Qualifier>> {
+        let quals = self.fhir_attr_map(did).qualifiers;
+        let names: UnordSet<_> = quals.iter().copied().collect();
+        Ok(self.qualifiers()?.iter().filter(move |qual| {
+            match qual.kind {
+                QualifierKind::Global => true,
+                QualifierKind::Hint => {
+                    self.flux_item_enclosing_item(qual.def_id.to_def_id()) == did.to_def_id()
+                }
+                QualifierKind::Local => names.contains(&qual.def_id),
+            }
+        }))
+    }
+
+    /// The item enclosing the declaration of a flux item. This is different from the
+    /// [`FluxDefId::parent`] for flux items declared with `defs!` that use the id of
+    /// the declaring `const _ = { }`.
+    fn flux_item_enclosing_item(self, def_id: FluxDefId) -> DefId {
+        let declarer = def_id.parent();
+        if self.def_kind(declarer) == DefKind::Const {
+            self.tcx().typeck_root_def_id(self.tcx().parent(declarer))
+        } else {
+            declarer
+        }
+    }
+
+    /// Return the list of flux function definitions that should be revelaed for item
+    pub fn reveals_for(self, did: LocalDefId) -> impl Iterator<Item = FluxDefId> + 'genv {
+        self.fhir_attr_map(did)
+            .reveals
             .iter()
-            .filter(move |qualifier| qualifier.global || names.contains(&qualifier.name)))
+            .map(|(def_id, _)| *def_id)
     }
 
-    pub fn func_decls(&self) -> impl Iterator<Item = &rty::FuncDecl> {
-        self.queries.func_decls(self).values()
+    /// Return the list of flux function definitions that should be hidden for item
+    pub fn hides_for(self, did: LocalDefId) -> impl Iterator<Item = FluxDefId> + 'genv {
+        self.fhir_attr_map(did)
+            .hides
+            .iter()
+            .map(|(def_id, _)| *def_id)
     }
 
-    pub fn func_decl(&self, name: impl Borrow<Symbol>) -> &rty::FuncDecl {
-        &self.queries.func_decls(self)[name.borrow()]
+    pub fn func_sort(self, def_id: impl IntoQueryKey<FluxDefId>) -> rty::PolyFuncSort {
+        self.inner.queries.func_sort(self, def_id.into_query_key())
     }
 
-    pub fn variances_of(&self, did: DefId) -> &[Variance] {
-        self.tcx.variances_of(did)
+    pub fn func_span(self, def_id: impl IntoQueryKey<FluxDefId>) -> Span {
+        self.inner.queries.func_span(self, def_id.into_query_key())
     }
 
-    pub fn mk_box(&self, ty: rty::Ty, alloc: rty::Ty) -> rty::Ty {
-        let def_id = self.tcx.require_lang_item(LangItem::OwnedBox, None);
-        let adt_def = self.adt_def(def_id).unwrap();
-
-        let args = vec![rty::GenericArg::Ty(ty), rty::GenericArg::Ty(alloc)];
-
-        let bty = rty::BaseTy::adt(adt_def, args);
-        rty::Ty::indexed(bty, rty::Expr::unit_adt(def_id))
+    /// Whether a (non-hidden) flux-def should be replaced by its body instead of being
+    /// represented as a `define-fun`. We inline all *polymorphic* flux-defs, since they cannot be
+    /// represented as `define-fun` in SMTLIB, but leave all *monomorphic* flux-defs un-inlined.
+    pub fn should_inline_fun(self, def_id: FluxDefId) -> bool {
+        self.func_sort(def_id).params().len() > 0
     }
 
-    pub fn mir(&self, def_id: LocalDefId) -> QueryResult<Rc<rustc::mir::Body<'tcx>>> {
-        self.queries.mir(self, def_id)
+    pub fn variances_of(self, did: DefId) -> &'tcx [Variance] {
+        self.tcx().variances_of(did)
     }
 
-    pub fn lower_generics_of(&self, def_id: impl Into<DefId>) -> QueryResult<ty::Generics<'tcx>> {
-        self.queries.lower_generics_of(self, def_id.into())
+    pub fn mir(self, def_id: LocalDefId) -> QueryResult<Rc<mir::BodyRoot<'tcx>>> {
+        self.inner.queries.mir(self, def_id)
+    }
+
+    pub fn lower_generics_of(self, def_id: impl IntoQueryKey<DefId>) -> ty::Generics<'tcx> {
+        self.inner
+            .queries
+            .lower_generics_of(self, def_id.into_query_key())
     }
 
     pub fn lower_predicates_of(
-        &self,
-        def_id: impl Into<DefId>,
+        self,
+        def_id: impl IntoQueryKey<DefId>,
     ) -> QueryResult<ty::GenericPredicates> {
-        self.queries.lower_predicates_of(self, def_id.into())
+        self.inner
+            .queries
+            .lower_predicates_of(self, def_id.into_query_key())
     }
 
-    pub fn lower_type_of(&self, def_id: impl Into<DefId>) -> QueryResult<ty::EarlyBinder<ty::Ty>> {
-        self.queries.lower_type_of(self, def_id.into())
+    pub fn lower_type_of(
+        self,
+        def_id: impl IntoQueryKey<DefId>,
+    ) -> QueryResult<ty::EarlyBinder<ty::Ty>> {
+        self.inner
+            .queries
+            .lower_type_of(self, def_id.into_query_key())
     }
 
-    pub fn lower_fn_sig(&self, def_id: DefId) -> QueryResult<ty::EarlyBinder<ty::PolyFnSig>> {
-        self.queries.lower_fn_sig(self, def_id)
+    pub fn lower_fn_sig(
+        self,
+        def_id: impl Into<DefId>,
+    ) -> QueryResult<ty::EarlyBinder<ty::PolyFnSig>> {
+        self.inner.queries.lower_fn_sig(self, def_id.into())
     }
 
-    pub fn adt_def(&self, def_id: impl Into<DefId>) -> QueryResult<rty::AdtDef> {
-        self.queries.adt_def(self, def_id.into())
+    pub fn adt_def(self, def_id: impl IntoQueryKey<DefId>) -> QueryResult<rty::AdtDef> {
+        self.inner.queries.adt_def(self, def_id.into_query_key())
     }
 
-    pub fn adt_sort_def_of(&self, def_id: impl Into<DefId>) -> rty::AdtSortDef {
-        self.queries.adt_sort_def_of(self, def_id.into())
+    pub fn invariants_of(
+        self,
+        def_id: impl IntoQueryKey<DefId>,
+    ) -> rty::EarlyBinder<List<rty::Invariant>> {
+        self.inner
+            .queries
+            .invariants_of(self, def_id.into_query_key())
     }
 
-    pub fn check_wf(
-        &self,
-        flux_id: impl Into<FluxLocalDefId>,
-    ) -> QueryResult<Rc<rty::WfckResults>> {
-        self.queries.check_wf(self, flux_id.into())
+    pub fn constant_info(self, def_id: impl IntoQueryKey<DefId>) -> QueryResult<rty::ConstantInfo> {
+        self.inner
+            .queries
+            .constant_info(self, def_id.into_query_key())
     }
 
-    pub fn generics_of(&self, def_id: impl Into<DefId>) -> QueryResult<rty::Generics> {
-        self.queries.generics_of(self, def_id.into())
+    /// The type of a static: its spec if it has one, or the default refinement of its rust type.
+    pub fn static_info(self, def_id: impl IntoQueryKey<DefId>) -> QueryResult<rty::Ty> {
+        self.inner
+            .queries
+            .static_info(self, def_id.into_query_key())
+    }
+
+    pub fn adt_sort_def_of(self, def_id: impl IntoQueryKey<DefId>) -> QueryResult<rty::AdtSortDef> {
+        self.inner
+            .queries
+            .adt_sort_def_of(self, def_id.into_query_key())
+    }
+
+    pub fn sort_decl_param_count(self, def_id: impl IntoQueryKey<FluxDefId>) -> usize {
+        self.inner
+            .queries
+            .sort_decl_param_count(self, def_id.into_query_key())
+    }
+
+    pub fn check_wf(self, def_id: LocalDefId) -> QueryResult<Rc<rty::WfckResults>> {
+        self.inner.queries.check_wf(self, def_id)
+    }
+
+    /// The refinement parameters of `def_id` that are *late bound*, i.e., bound in the fn signature
+    /// instead of being part of the item's refinement generics. This is the analog of rustc's
+    /// `is_late_bound_map` for refinement parameters.
+    ///
+    /// A refinement parameter of a fn-like item is late bound unless it is a location or it is
+    /// mentioned in a where-clause or in the bounds of an opaque type. Items that are not fn-like
+    /// have no late bound parameters.
+    pub fn late_bound_refinement_params(
+        self,
+        def_id: LocalDefId,
+    ) -> QueryResult<&'genv [fhir::ParamId]> {
+        self.inner
+            .queries
+            .late_bound_refinement_params(self, def_id)
+    }
+
+    pub fn impl_trait_ref(self, impl_id: DefId) -> QueryResult<rty::EarlyBinder<rty::TraitRef>> {
+        let trait_ref = self.tcx().impl_trait_ref(impl_id);
+        let trait_ref = trait_ref.skip_binder();
+        let trait_ref = trait_ref
+            .lower(self.tcx())
+            .map_err(|err| QueryErr::unsupported(impl_id, err.into_err()))?
+            .refine(&Refiner::default_for_item(self, impl_id)?)?;
+        Ok(rty::EarlyBinder(trait_ref))
+    }
+
+    pub fn generics_of(self, def_id: impl IntoQueryKey<DefId>) -> QueryResult<rty::Generics> {
+        self.inner
+            .queries
+            .generics_of(self, def_id.into_query_key())
     }
 
     pub fn refinement_generics_of(
-        &self,
-        def_id: impl Into<DefId>,
-    ) -> QueryResult<rty::RefinementGenerics> {
-        self.queries.refinement_generics_of(self, def_id.into())
+        self,
+        def_id: impl IntoQueryKey<DefId>,
+    ) -> QueryResult<rty::EarlyBinder<rty::RefinementGenerics>> {
+        self.inner
+            .queries
+            .refinement_generics_of(self, def_id.into_query_key())
     }
 
     pub fn predicates_of(
-        &self,
-        def_id: impl Into<DefId>,
+        self,
+        def_id: impl IntoQueryKey<DefId>,
     ) -> QueryResult<rty::EarlyBinder<rty::GenericPredicates>> {
-        self.queries.predicates_of(self, def_id.into())
+        self.inner
+            .queries
+            .predicates_of(self, def_id.into_query_key())
     }
 
-    pub fn assoc_predicates_of(
-        &self,
-        def_id: impl Into<DefId>,
-    ) -> QueryResult<rty::AssocPredicates> {
-        self.queries.assoc_predicates_of(self, def_id.into())
+    pub fn assoc_refinements_of(
+        self,
+        def_id: impl IntoQueryKey<DefId>,
+    ) -> QueryResult<rty::AssocRefinements> {
+        self.inner
+            .queries
+            .assoc_refinements_of(self, def_id.into_query_key())
     }
 
-    pub fn assoc_predicate_of(
-        &self,
-        def_id: impl Into<DefId>,
-        name: Symbol,
-    ) -> QueryResult<Option<rty::AssocPredicate>> {
-        let pred = self
-            .assoc_predicates_of(def_id)?
-            .predicates
-            .iter()
-            .find(|assoc_pred| assoc_pred.name == name)
-            .cloned();
-        Ok(pred)
+    pub fn assoc_refinement(self, assoc_id: FluxDefId) -> QueryResult<rty::AssocReft> {
+        Ok(self.assoc_refinements_of(assoc_id.parent())?.get(assoc_id))
     }
 
-    pub fn item_bounds(&self, def_id: DefId) -> QueryResult<rty::EarlyBinder<List<rty::Clause>>> {
-        self.queries.item_bounds(self, def_id)
+    /// Given the id of an associated refinement in a trait definition returns the body for the
+    /// corresponding associated refinement in the implementation with id `impl_id`.
+    ///
+    /// This function returns [`QueryErr::MissingAssocReft`] if the associated refinement is not
+    /// found in the implementation and there's no default body in the trait. This can happen if an
+    /// extern spec adds an associated refinement without a default body because we are currently
+    /// not checking `compare_impl_item` for those definitions.
+    pub fn assoc_refinement_body_for_impl(
+        self,
+        trait_assoc_id: FluxDefId,
+        impl_id: DefId,
+    ) -> QueryResult<rty::EarlyBinder<rty::Lambda>> {
+        // Check if the implementation has the associated refinement
+        let impl_assoc_refts = self.assoc_refinements_of(impl_id)?;
+        if let Some(impl_assoc_reft) = impl_assoc_refts.find(trait_assoc_id.name()) {
+            return self.assoc_refinement_body(impl_assoc_reft.def_id());
+        }
+
+        // Otherwise, check if the trait has a default body
+        if let Some(body) = self.default_assoc_refinement_body(trait_assoc_id)? {
+            let impl_trait_ref = self.impl_trait_ref(impl_id)?.instantiate_identity();
+            return Ok(rty::EarlyBinder(body.instantiate(self.tcx(), &impl_trait_ref.args, &[])));
+        }
+
+        Err(QueryErr::MissingAssocReft {
+            impl_id,
+            trait_id: trait_assoc_id.parent(),
+            name: trait_assoc_id.name(),
+        })
     }
 
-    pub fn type_of(&self, def_id: DefId) -> QueryResult<rty::EarlyBinder<rty::PolyTy>> {
-        self.queries.type_of(self, def_id)
+    pub fn default_assoc_refinement_body(
+        self,
+        trait_assoc_id: FluxDefId,
+    ) -> QueryResult<Option<rty::EarlyBinder<rty::Lambda>>> {
+        self.inner
+            .queries
+            .default_assoc_refinement_body(self, trait_assoc_id)
+    }
+
+    pub fn assoc_refinement_body(
+        self,
+        impl_assoc_id: FluxDefId,
+    ) -> QueryResult<rty::EarlyBinder<rty::Lambda>> {
+        self.inner
+            .queries
+            .assoc_refinement_body(self, impl_assoc_id)
+    }
+
+    pub fn sort_of_assoc_reft(
+        self,
+        assoc_id: FluxDefId,
+    ) -> QueryResult<rty::EarlyBinder<rty::FuncSort>> {
+        self.inner.queries.sort_of_assoc_reft(self, assoc_id)
+    }
+
+    pub fn item_bounds(
+        self,
+        def_id: impl IntoQueryKey<DefId>,
+    ) -> QueryResult<rty::EarlyBinder<List<rty::Clause>>> {
+        self.inner
+            .queries
+            .item_bounds(self, def_id.into_query_key())
+    }
+
+    pub fn type_of(
+        self,
+        def_id: impl IntoQueryKey<DefId>,
+    ) -> QueryResult<rty::EarlyBinder<rty::TyOrCtor>> {
+        self.inner.queries.type_of(self, def_id.into_query_key())
     }
 
     pub fn fn_sig(
-        &self,
-        def_id: impl Into<DefId>,
+        self,
+        def_id: impl IntoQueryKey<DefId>,
     ) -> QueryResult<rty::EarlyBinder<rty::PolyFnSig>> {
-        self.queries.fn_sig(self, def_id.into())
+        self.inner.queries.fn_sig(self, def_id.into_query_key())
+    }
+
+    pub fn feed_weak_kvars(self, def_id: DefId, wk: WeakKvarMap) {
+        self.inner
+            .weak_kvars
+            .borrow_mut()
+            .insert(def_id, Rc::new(wk));
+    }
+
+    pub fn weak_kvars_for(self, def_id: DefId) -> Option<Rc<WeakKvarMap>> {
+        self.inner.weak_kvars.borrow().get(&def_id).cloned()
     }
 
     pub fn variants_of(
-        &self,
-        def_id: DefId,
+        self,
+        def_id: impl IntoQueryKey<DefId>,
     ) -> QueryResult<rty::Opaqueness<rty::EarlyBinder<rty::PolyVariants>>> {
-        self.queries.variants_of(self, def_id)
+        self.inner
+            .queries
+            .variants_of(self, def_id.into_query_key())
     }
 
     pub fn variant_sig(
-        &self,
+        self,
         def_id: DefId,
         variant_idx: VariantIdx,
     ) -> QueryResult<rty::Opaqueness<rty::EarlyBinder<rty::PolyVariant>>> {
@@ -191,143 +587,504 @@ impl<'sess, 'tcx> GlobalEnv<'sess, 'tcx> {
             .map(|variants| variants.map(|variants| variants[variant_idx.as_usize()].clone())))
     }
 
-    pub fn lower_late_bound_vars(
-        &self,
-        def_id: LocalDefId,
-    ) -> QueryResult<List<rustc::ty::BoundVariableKind>> {
-        self.queries.lower_late_bound_vars(self, def_id)
+    /// Whether the crate has Flux metadata in the cratestore.
+    pub fn cstore_has_crate(self, krate: CrateNum) -> bool {
+        self.cstore().has_crate(krate)
     }
 
-    pub fn get_generic_param(&self, def_id: LocalDefId) -> &fhir::GenericParam {
-        let owner = self.hir().ty_param_owner(def_id);
-        self.map()
-            .get_generics(self.tcx, owner)
-            .unwrap()
-            .get_param(def_id)
+    /// Whether the function is marked with `#[flux::no_panic]`
+    pub fn no_panic(self, def_id: impl IntoQueryKey<DefId>) -> bool {
+        self.inner.queries.no_panic(self, def_id.into_query_key())
+    }
+
+    pub fn assume_parametric_params(self, def_id: impl IntoQueryKey<DefId>) -> UnordSet<u32> {
+        self.inner
+            .queries
+            .assume_parametric_params(self, def_id.into_query_key())
     }
 
     pub fn is_box(&self, res: fhir::Res) -> bool {
-        if let fhir::Res::Def(DefKind::Struct, def_id) = res {
-            self.tcx.adt_def(def_id).is_box()
+        res.is_box(self.tcx())
+    }
+
+    pub fn def_id_to_param_index(&self, def_id: DefId) -> u32 {
+        let parent = self.tcx().parent(def_id);
+        let generics = self.tcx().generics_of(parent);
+        generics.param_def_id_to_index(self.tcx(), def_id).unwrap()
+    }
+
+    pub(crate) fn cstore(self) -> &'genv CrateStoreDyn<'tcx> {
+        &*self.inner.cstore
+    }
+
+    pub fn has_trusted_impl(&self, def_id: DefId) -> bool {
+        if let Some(did) = self
+            .resolve_id(def_id)
+            .as_maybe_extern()
+            .map(|id| id.local_id())
+        {
+            self.trusted_impl(did)
         } else {
             false
         }
     }
 
-    pub fn const_by_name(&self, name: impl Borrow<Symbol>) -> Option<&fhir::ConstInfo> {
-        self.map().const_by_name(name)
-    }
-
-    pub fn def_id_to_param_ty(&self, def_id: LocalDefId) -> rty::ParamTy {
-        rty::ParamTy {
-            index: self.def_id_to_param_index(def_id),
-            name: self.tcx.hir().ty_param_name(def_id),
-        }
-    }
-
-    pub fn def_id_to_param_index(&self, def_id: LocalDefId) -> u32 {
-        let item_def_id = self.tcx.hir().ty_param_owner(def_id);
-        let generics = self.tcx.generics_of(item_def_id);
-        generics.param_def_id_to_index[&def_id.to_def_id()]
-    }
-
-    /// Whether values of this sort can be compared for equality.
-    pub fn has_equality(&self, sort: &rty::Sort) -> bool {
-        match sort {
-            rty::Sort::Int
-            | rty::Sort::Bool
-            | rty::Sort::Real
-            | rty::Sort::BitVec(_)
-            | rty::Sort::Param(_)
-            | rty::Sort::Var(_) => true,
-            rty::Sort::Tuple(sorts) => sorts.iter().all(|sort| self.has_equality(sort)),
-            rty::Sort::Adt(sort_def, sort_args) => {
-                sort_def
-                    .sorts(sort_args)
-                    .iter()
-                    .all(|sort| self.has_equality(sort))
-            }
-            rty::Sort::App(ctor, sorts) => self.ctor_has_equality(ctor, sorts),
-            rty::Sort::Err | rty::Sort::Loc | rty::Sort::Func(_) | rty::Sort::Infer(_) => false,
-        }
-    }
-
-    /// For now all sort constructors have equality if all the generic arguments do. In the
-    /// future we may have a more fine-grained notion of equality for sort constructors.
-    fn ctor_has_equality(&self, _: &rty::SortCtor, args: &[rty::Sort]) -> bool {
-        args.iter().all(|sort| self.has_equality(sort))
-    }
-
-    pub fn refine_default_generic_args(
-        &self,
-        generics: &rty::Generics,
-        args: &ty::GenericArgs,
-    ) -> QueryResult<rty::GenericArgs> {
-        let refiner = Refiner::default(self, generics);
-        let mut res = vec![];
-        for arg in args {
-            res.push(refiner.refine_generic_arg_raw(arg)?);
-        }
-        Ok(res.into())
-    }
-
-    pub fn refine_default(
-        &self,
-        generics: &rty::Generics,
-        rustc_ty: &ty::Ty,
-    ) -> QueryResult<rty::Ty> {
-        Refiner::default(self, generics).refine_ty(rustc_ty)
-    }
-
-    pub fn refine_with_holes(
-        &self,
-        generics: &rty::Generics,
-        rustc_ty: &ty::Ty,
-    ) -> QueryResult<rty::Ty> {
-        Refiner::with_holes(self, generics).refine_ty(rustc_ty)
-    }
-
-    pub fn instantiate_arg_for_fun(
-        &self,
-        generics: &rty::Generics,
-        param: &rty::GenericParamDef,
-        arg: &ty::GenericArg,
-    ) -> QueryResult<rty::GenericArg> {
-        Refiner::new(self, generics, |bty| {
-            let sort = bty.sort();
-            let mut ty = rty::Ty::indexed(bty.shift_in_escaping(1), rty::Expr::nu());
-            if !sort.is_unit() {
-                ty = rty::Ty::constr(rty::Expr::hole(rty::HoleKind::Pred), ty);
-            }
-            rty::Binder::with_sort(ty, sort)
-        })
-        .refine_generic_arg(param, arg)
-    }
-
-    pub fn instantiate_arg_for_constructor(
-        &self,
-        generics: &rty::Generics,
-        param: &rty::GenericParamDef,
-        arg: &ty::GenericArg,
-    ) -> QueryResult<rty::GenericArg> {
-        Refiner::with_holes(self, generics).refine_generic_arg(param, arg)
-    }
-
-    pub(crate) fn cstore(&self) -> &CrateStoreDyn {
-        &*self.cstore
-    }
-
-    pub fn hir(&self) -> rustc_middle::hir::map::Map<'tcx> {
-        self.tcx.hir()
-    }
-
-    pub(crate) fn lookup_extern(&self, def_id: DefId) -> Option<DefId> {
-        self.map().get_extern(def_id).map(LocalDefId::to_def_id)
-    }
-
-    pub(crate) fn is_fn_once_output(&self, def_id: DefId) -> bool {
-        self.tcx
-            .require_lang_item(rustc_hir::LangItem::FnOnceOutput, None)
+    /// The `Output` associated type is defined in `FnOnce`, and `Fn`/`FnMut`
+    /// inherit it, so this should suffice to check if the `def_id`
+    /// corresponds to `LangItem::FnOnceOutput`.
+    pub fn is_fn_output(&self, def_id: DefId) -> bool {
+        let def_span = self.tcx().def_span(def_id);
+        self.tcx()
+            .require_lang_item(LangItem::FnOnceOutput, def_span)
             == def_id
     }
+
+    /// Returns whether `def_id` is the `call` method in the `Fn` trait,
+    /// the `call_mut` method in the `FnMut` trait,
+    /// or the `call_once` method in the `FnOnce` trait.
+    pub fn is_fn_call(&self, def_id: DefId) -> bool {
+        let methods_and_names = [
+            (LangItem::Fn, sym::call),
+            (LangItem::FnMut, sym::call_mut),
+            (LangItem::FnOnce, sym::call_once),
+        ];
+        let tcx = self.tcx();
+        let Some(assoc_item) = tcx.opt_associated_item(def_id) else { return false };
+        let Some(trait_id) = assoc_item.trait_container(tcx) else { return false };
+
+        methods_and_names.iter().any(|(lang_item, method_name)| {
+            assoc_item.name() == *method_name && tcx.is_lang_item(trait_id, *lang_item)
+        })
+    }
+
+    /// Iterator over all local def ids that are not an extern spec
+    pub fn iter_local_def_id(self) -> impl Iterator<Item = LocalDefId> + use<'tcx, 'genv> {
+        self.tcx().iter_local_def_id().filter(move |&local_def_id| {
+            self.maybe_extern_id(local_def_id).is_local() && !self.is_dummy(local_def_id)
+        })
+    }
+
+    pub fn iter_extern_def_id(self) -> impl Iterator<Item = DefId> + use<'tcx, 'genv> {
+        self.tcx()
+            .iter_local_def_id()
+            .filter_map(move |local_def_id| self.maybe_extern_id(local_def_id).as_extern())
+    }
+
+    pub fn maybe_extern_id(self, local_id: LocalDefId) -> MaybeExternId {
+        self.collect_specs()
+            .local_id_to_extern_id
+            .get(&local_id)
+            .map_or_else(
+                || MaybeExternId::Local(local_id),
+                |def_id| MaybeExternId::Extern(local_id, *def_id),
+            )
+    }
+
+    #[expect(clippy::disallowed_methods)]
+    pub fn resolve_id(self, def_id: DefId) -> ResolvedDefId {
+        let maybe_extern_spec = self
+            .collect_specs()
+            .extern_id_to_local_id
+            .get(&def_id)
+            .copied();
+        if let Some(local_id) = maybe_extern_spec {
+            ResolvedDefId::ExternSpec(local_id, def_id)
+        } else if let Some(local_id) = def_id.as_local() {
+            debug_assert!(
+                self.maybe_extern_id(local_id).is_local(),
+                "def id points to dummy local item `{def_id:?}`"
+            );
+            ResolvedDefId::Local(local_id)
+        } else {
+            ResolvedDefId::Extern(def_id)
+        }
+    }
+
+    pub fn infer_opts(self, def_id: LocalDefId) -> config::InferOpts {
+        let mut opts = config::PartialInferOpts::default();
+        self.traverse_parents(def_id, |did| {
+            if let Some(o) = self.fhir_attr_map(did).infer_opts() {
+                opts.merge(&o);
+            }
+            None::<!>
+        });
+        opts.into()
+    }
+
+    fn matches_file_path<F>(&self, def_id: MaybeExternId, matcher: F) -> bool
+    where
+        F: Fn(&Path) -> bool,
+    {
+        let def_id = def_id.local_id();
+        let tcx = self.tcx();
+        let span = tcx.def_span(def_id);
+        let sm = tcx.sess.source_map();
+        let FileName::Real(file_name) = sm.span_to_filename(span) else { return true };
+        let Some(mut file_path) = file_name.local_path() else { return true };
+
+        // If the path is absolute try to normalize it to be relative to the working_dir
+        if file_path.is_absolute() {
+            let Some(working_dir) = sm.working_dir().local_path() else { return true };
+            let Ok(p) = file_path.strip_prefix(working_dir) else { return true };
+            file_path = p;
+        }
+
+        matcher(file_path)
+    }
+
+    fn matches_def(&self, def_id: MaybeExternId, def: &str) -> bool {
+        // Does this def_id's name contain `fn_name`?
+        let def_path = self.tcx().def_path_str(def_id.local_id());
+        def_path.contains(def)
+    }
+
+    fn matches_pos(&self, def_id: MaybeExternId, line: usize, col: usize) -> bool {
+        let def_id = def_id.local_id();
+        let tcx = self.tcx();
+        let hir_id = tcx.local_def_id_to_hir_id(def_id);
+        let body_span = tcx.hir_span_with_body(hir_id);
+        let source_map = tcx.sess.source_map();
+        let lo_pos = source_map.lookup_char_pos(body_span.lo());
+        let start_line = lo_pos.line;
+        let start_col = lo_pos.col_display;
+        let hi_pos = source_map.lookup_char_pos(body_span.hi());
+        let end_line = hi_pos.line;
+        let end_col = hi_pos.col_display;
+
+        // is the line in the range of the body?
+        if start_line < end_line {
+            // multiple lines: check if the line is in the range
+            start_line <= line && line <= end_line
+        } else {
+            // single line: check if the line is the same and the column is in range
+            start_line == line && start_col <= col && col <= end_col
+        }
+    }
+
+    /// Check whether the `def_id` (or the file where `def_id` is defined)
+    /// is in the `include` pattern, and conservatively return `true` if
+    /// anything unexpected happens.
+    fn matches_pattern(&self, def_id: MaybeExternId, pattern: &IncludePattern) -> bool {
+        if self.matches_file_path(def_id, |path| pattern.glob.is_match(path)) {
+            return true;
+        }
+        if pattern.defs.iter().any(|def| self.matches_def(def_id, def)) {
+            return true;
+        }
+        if pattern.spans.iter().any(|pos| {
+            self.matches_file_path(def_id, |path| path.ends_with(&pos.file))
+                && self.matches_pos(def_id, pos.line, pos.column)
+        }) {
+            return true;
+        }
+        false
+    }
+
+    /// Check whether the `def_id` (or the file where `def_id` is defined)
+    /// is in the `include_trusted` pattern, and conservatively return `false` if
+    /// anything unexpected happens.
+    fn matches_trusted_pattern(&self, def_id: MaybeExternId) -> bool {
+        let Some(pattern) = config::trusted_pattern() else { return false };
+        self.matches_pattern(def_id, pattern)
+    }
+
+    /// Check whether the `def_id` (or the file where `def_id` is defined)
+    /// is in the `include_trusted_impl` pattern, and conservatively return `false` if
+    /// anything unexpected happens.
+    fn matches_trusted_impl_pattern(&self, def_id: MaybeExternId) -> bool {
+        let Some(pattern) = config::trusted_impl_pattern() else { return false };
+        self.matches_pattern(def_id, pattern)
+    }
+
+    /// Check whether the `def_id` (or the file where `def_id` is defined)
+    /// is in the `include` pattern, and conservatively return `true` if
+    /// anything unexpected happens.
+    fn matches_included_pattern(&self, def_id: MaybeExternId) -> bool {
+        let Some(pattern) = config::include_pattern() else { return true };
+        self.matches_pattern(def_id, pattern)
+    }
+
+    pub fn included(&self, def_id: MaybeExternId) -> bool {
+        self.matches_included_pattern(def_id) || self.matches_trusted_pattern(def_id)
+    }
+
+    /// Transitively follow the parent-chain of `def_id` to find the first containing item with an
+    /// explicit `#[flux::trusted(..)]` annotation and return whether that item is trusted or not.
+    /// If no explicit annotation is found, return `false`.
+    pub fn trusted(self, def_id: LocalDefId) -> bool {
+        let annotation = self
+            .traverse_parents(def_id, |did| self.fhir_attr_map(did).trusted())
+            .map(|trusted| trusted.to_bool())
+            .unwrap_or_else(config::trusted_default);
+        annotation || self.matches_trusted_pattern(MaybeExternId::Local(def_id))
+    }
+
+    pub fn trusted_impl(self, def_id: LocalDefId) -> bool {
+        let annotation = self
+            .traverse_parents(def_id, |did| self.fhir_attr_map(did).trusted_impl())
+            .map(|trusted| trusted.to_bool())
+            .unwrap_or(false);
+        annotation || self.matches_trusted_impl_pattern(MaybeExternId::Local(def_id))
+    }
+
+    /// Whether code generated by a `#[derive(..)]` on this ADT should be trusted.
+    /// A `#[flux::opaque]` type implicitly trusts its derives.
+    pub fn trusted_derive(self, def_id: LocalDefId) -> bool {
+        if let Some(trusted) = self.fhir_attr_map(def_id).trusted_derive() {
+            return trusted.to_bool();
+        }
+        self.adt_def(def_id)
+            .is_ok_and(|adt_def| adt_def.is_opaque())
+    }
+
+    /// For a `def_id` generated by a `#[derive(..)]`, the ADT the derive was applied to, i.e. the
+    /// self type of the enclosing impl.
+    ///
+    /// Returns `None` if `def_id` is not an impl item or if the self type is not a local ADT. A
+    /// derive is not obliged to generate impl items: a proc-macro derive can emit a free function
+    /// at module scope, or a function inside a generated trait. In those cases the parent is a
+    /// module or trait, for which `type_of` is not defined, so the parent's kind must be checked
+    /// before asking for its type.
+    pub fn derive_self_ty(self, def_id: LocalDefId) -> Option<LocalDefId> {
+        let tcx = self.tcx();
+        let impl_id = tcx.local_parent(def_id);
+        if !matches!(tcx.def_kind(impl_id), DefKind::Impl { .. }) {
+            return None;
+        }
+        let adt_def_id = tcx
+            .type_of(impl_id)
+            .instantiate_identity()
+            .skip_norm_wip()
+            .ty_adt_def()?
+            .did();
+        match self.resolve_id(adt_def_id) {
+            ResolvedDefId::Local(local_id) | ResolvedDefId::ExternSpec(local_id, _) => {
+                Some(local_id)
+            }
+            ResolvedDefId::Extern(_) => None,
+        }
+    }
+
+    /// Same behavior as [`trusted`], but for the `#[no_suggestions]` attribute.
+    /// (overridden to `true` by suggestions being globally disabled).
+    pub fn no_suggestions(self, def_id: LocalDefId) -> bool {
+        if !config::suggestions() {
+            return true;
+        }
+        self.traverse_parents(def_id, |did| {
+            // A parent has no_suggestions, we inherit it
+            if self.fhir_attr_map(did).no_suggestions() {
+                Some(true)
+            // It doesn't have it, keep trying
+            } else {
+                None
+            }
+        })
+        .unwrap_or(false)
+    }
+
+    /// Whether the item is a dummy item created by the extern spec macro.
+    ///
+    /// See [`crate::Specs::dummy_extern`]
+    pub fn is_dummy(self, def_id: LocalDefId) -> bool {
+        self.traverse_parents(def_id, |did| {
+            self.collect_specs()
+                .dummy_extern
+                .contains(&did)
+                .then_some(())
+        })
+        .is_some()
+    }
+
+    /// Transitively follow the parent-chain of `def_id` to find the first containing item with an
+    /// explicit `#[flux::ignore(..)]` annotation and return whether that item is ignored or not.
+    /// If no explicit annotation is found, return `false`.
+    pub fn ignored(self, def_id: LocalDefId) -> bool {
+        self.traverse_parents(def_id, |did| self.fhir_attr_map(did).ignored())
+            .map(|ignored| ignored.to_bool())
+            .unwrap_or_else(config::ignore_default)
+    }
+
+    /// Whether the function is marked with `#[flux::should_fail]`
+    pub fn should_fail(self, def_id: LocalDefId) -> bool {
+        self.fhir_attr_map(def_id).should_fail()
+    }
+
+    /// Whether the function is marked with `#[proven_externally]`
+    pub fn proven_externally(self, def_id: LocalDefId) -> Option<Span> {
+        self.fhir_attr_map(def_id).proven_externally()
+    }
+
+    /// Get the span of the #[sig(...)] attribute for a function, if it exists.
+    /// Checks local specs (including extern spec mapping) then falls back to cross-crate metadata.
+    pub fn spec_attr_span(self, def_id: DefId) -> Option<Span> {
+        let specs = self.collect_specs();
+        specs
+            .get_spec_attr_span(def_id)
+            .or_else(|| {
+                let local_id = specs.extern_id_to_local_id.get(&def_id)?;
+                specs.get_spec_attr_span(local_id.to_def_id())
+            })
+            .or_else(|| self.cstore().spec_attr_span(def_id))
+    }
+
+    /// Get the source text of the #[sig(...)] attribute for a function.
+    /// Reconstructs the string from the spec attribute span via the source map.
+    pub fn spec_attr_string(self, def_id: DefId) -> Option<String> {
+        let span = self.spec_attr_span(def_id)?;
+        self.tcx().sess.source_map().span_to_snippet(span).ok()
+    }
+
+    /// Traverse the parent chain of `def_id` until the first node for which `f` returns [`Some`].
+    fn traverse_parents<T>(
+        self,
+        mut def_id: LocalDefId,
+        mut f: impl FnMut(LocalDefId) -> Option<T>,
+    ) -> Option<T> {
+        loop {
+            if let Some(v) = f(def_id) {
+                break Some(v);
+            }
+
+            if let Some(parent) = self.tcx().opt_local_parent(def_id) {
+                def_id = parent;
+            } else {
+                break None;
+            }
+        }
+    }
+}
+
+impl<'genv, 'tcx> GlobalEnv<'genv, 'tcx> {
+    pub fn fhir_iter_flux_items(
+        self,
+    ) -> impl Iterator<Item = (FluxLocalDefId, fhir::FluxItem<'genv>)> {
+        self.fhir_crate()
+            .items
+            .iter()
+            .map(|(id, item)| (*id, *item))
+    }
+
+    pub fn fhir_sort_decl(&self, def_id: FluxLocalDefId) -> Option<&fhir::SortDecl> {
+        self.fhir_crate().items.get(&def_id).and_then(|item| {
+            if let fhir::FluxItem::SortDecl(sort_decl) = item { Some(*sort_decl) } else { None }
+        })
+    }
+
+    pub fn fhir_spec_func_body(
+        &self,
+        def_id: FluxLocalDefId,
+    ) -> Option<&'genv fhir::SpecFunc<'genv>> {
+        self.fhir_crate()
+            .items
+            .get(&def_id)
+            .and_then(|item| if let fhir::FluxItem::Func(defn) = item { Some(*defn) } else { None })
+    }
+
+    pub fn fhir_qualifiers(self) -> impl Iterator<Item = &'genv fhir::Qualifier<'genv>> {
+        self.fhir_crate().items.values().filter_map(|item| {
+            if let fhir::FluxItem::Qualifier(qual) = item { Some(*qual) } else { None }
+        })
+    }
+
+    pub fn fhir_primop_props(self) -> impl Iterator<Item = &'genv fhir::PrimOpProp<'genv>> {
+        self.fhir_crate().items.values().filter_map(|item| {
+            if let fhir::FluxItem::PrimOpProp(prop) = item { Some(*prop) } else { None }
+        })
+    }
+
+    pub fn fhir_axioms(self) -> impl Iterator<Item = &'genv fhir::Axiom<'genv>> {
+        self.fhir_crate().items.values().filter_map(|item| {
+            if let fhir::FluxItem::Axiom(axiom) = item { Some(*axiom) } else { None }
+        })
+    }
+
+    pub fn fhir_get_generics(
+        self,
+        def_id: LocalDefId,
+    ) -> QueryResult<Option<&'genv fhir::Generics<'genv>>> {
+        // We don't have nodes for closures and coroutines
+        if matches!(self.def_kind(def_id), DefKind::Closure) {
+            Ok(None)
+        } else {
+            Ok(Some(self.fhir_expect_owner_node(def_id)?.generics()))
+        }
+    }
+
+    /// Splits the refinement parameters in the generics of `def_id` into early and late bound
+    /// parameters (in that order) preserving declaration order.
+    /// See [`GlobalEnv::late_bound_refinement_params`].
+    pub fn fhir_split_refinement_params(
+        self,
+        def_id: LocalDefId,
+    ) -> QueryResult<(Vec<fhir::RefineParam<'genv>>, Vec<fhir::RefineParam<'genv>>)> {
+        let Some(generics) = self.fhir_get_generics(def_id)? else {
+            return Ok((vec![], vec![]));
+        };
+        let late_bound = self.late_bound_refinement_params(def_id)?;
+        Ok(generics
+            .refinement_params
+            .iter()
+            .copied()
+            .partition(|param| !late_bound.contains(&param.id)))
+    }
+
+    pub fn fhir_expect_refinement_kind(
+        self,
+        def_id: LocalDefId,
+    ) -> QueryResult<&'genv fhir::RefinementKind<'genv>> {
+        let kind = match &self.fhir_expect_item(def_id)?.kind {
+            fhir::ItemKind::Enum(enum_def) => &enum_def.refinement,
+            fhir::ItemKind::Struct(struct_def) => &struct_def.refinement,
+            _ => bug!("expected struct, enum or type alias"),
+        };
+        Ok(kind)
+    }
+
+    pub fn fhir_expect_item(self, def_id: LocalDefId) -> QueryResult<&'genv fhir::Item<'genv>> {
+        if let fhir::Node::Item(item) = self.fhir_node(def_id)? {
+            Ok(item)
+        } else {
+            Err(query_bug!(def_id, "expected item: `{def_id:?}`"))
+        }
+    }
+
+    pub fn fhir_expect_owner_node(self, def_id: LocalDefId) -> QueryResult<fhir::OwnerNode<'genv>> {
+        let Some(owner) = self.fhir_node(def_id)?.as_owner() else {
+            return Err(query_bug!(def_id, "cannot find owner node"));
+        };
+        Ok(owner)
+    }
+
+    pub fn fhir_node(self, def_id: LocalDefId) -> QueryResult<fhir::Node<'genv>> {
+        self.desugar(def_id)
+    }
+}
+
+#[macro_export]
+macro_rules! try_alloc_slice {
+    ($genv:expr, $slice:expr, $map:expr $(,)?) => {{
+        let slice = $slice;
+        $crate::try_alloc_slice!($genv, cap: slice.len(), slice.into_iter().map($map))
+    }};
+    ($genv:expr, cap: $cap:expr, $it:expr $(,)?) => {{
+        let mut err = None;
+        let slice = $genv.alloc_slice_with_capacity($cap, $it.into_iter().collect_errors(&mut err));
+        err.map_or(Ok(slice), Err)
+    }};
+}
+
+impl ErrorEmitter for GlobalEnv<'_, '_> {
+    fn emit<'a>(&'a self, err: impl rustc_errors::Diagnostic<'a>) -> rustc_span::ErrorGuaranteed {
+        self.sess().emit(err)
+    }
+}
+
+fn lean_parent_dir(tcx: TyCtxt) -> PathBuf {
+    tcx.sess
+        .source_map()
+        .working_dir()
+        .local_path()
+        .unwrap()
+        .join(config::lean_dir())
 }

@@ -1,114 +1,104 @@
-#[cfg(not(flux_sysroot))]
-use attr_dummy as attr_impl;
-#[cfg(flux_sysroot)]
-use attr_sysroot as attr_impl;
-use proc_macro::TokenStream;
+#![no_std]
+#[cfg_attr(flux, flux::no_suggestions)]
+pub mod bitvec;
 
-#[proc_macro_attribute]
-pub fn alias(attr: TokenStream, tokens: TokenStream) -> TokenStream {
-    attr_impl::alias(attr, tokens)
+pub use attrs::*;
+pub use flux_attrs as attrs;
+
+#[no_suggestions]
+#[sig(fn(bool[true]) )]
+pub fn assert(_: bool) {}
+
+#[no_suggestions]
+#[sig (fn() -> _ requires false)]
+pub fn unreachable() -> ! {
+    unreachable!("impossible case")
 }
 
-#[proc_macro_attribute]
-pub fn sig(attr: TokenStream, tokens: TokenStream) -> TokenStream {
-    attr_impl::sig(attr, tokens)
+/// Macro for creating detached specifications.
+///
+/// # Example
+/// ```
+/// flux_rs::macros::detached_spec! {
+///     fn inc(n:i32) -> i32[n+1];
+///     fn watermelon(n:usize) -> usize[n+2];
+/// }
+/// ```
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __private_detached_spec {
+    ($($e:tt)*) => {
+        #[$crate::specs {
+            $($e)*
+        }]
+        const _: () = ();
+    };
 }
 
-#[proc_macro_attribute]
-pub fn qualifiers(attr: TokenStream, tokens: TokenStream) -> TokenStream {
-    attr_impl::qualifiers(attr, tokens)
+/// Macro for creating `invariant qualifier`s
+/// # Example
+/// ```
+/// invariant!(res: int, i: int, n: int ; res + i == n);
+/// ```
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __private_invariant {
+    ($($param:ident : $ty:ty),* ; $expr:expr) => {
+        $crate::defs! {
+            invariant qualifier Auto($($param: $ty),*) { $expr }
+        }
+        $crate::assert($expr);
+    };
 }
 
-#[proc_macro_attribute]
-pub fn refined_by(attr: TokenStream, tokens: TokenStream) -> TokenStream {
-    attr_impl::refined_by(attr, tokens)
+/// Macro for creating `invariant qualifier`s without an assertion.
+///
+/// Unlike [`invariant`](crate::macros::invariant), the body is never re-emitted as Rust, so it
+/// may use refinement-only syntax. Sorts are inferred; annotate the ones that can't be, using
+/// the same `params ; body` syntax as [`invariant`](crate::macros::invariant).
+///
+/// # Example
+/// ```
+/// flux_rs::macros::qualifier!(my_plus(res, i) == n);
+/// flux_rs::macros::qualifier!(res: int, i: int ; res + i == n);
+/// ```
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __private_qualifier {
+    ($($param:ident : $ty:ty),+ ; $($body:tt)*) => {
+        $crate::defs! {
+            invariant qualifier Auto($($param: $ty),+) { $($body)* }
+        }
+    };
+    ($($body:tt)*) => {
+        $crate::defs! {
+            invariant qualifier Auto() { $($body)* }
+        }
+    };
 }
 
-#[proc_macro_attribute]
-pub fn invariant(attr: TokenStream, tokens: TokenStream) -> TokenStream {
-    attr_impl::invariant(attr, tokens)
-}
-
-#[proc_macro_attribute]
-pub fn constant(attr: TokenStream, tokens: TokenStream) -> TokenStream {
-    attr_impl::constant(attr, tokens)
-}
-
-#[proc_macro_attribute]
-pub fn opaque(attr: TokenStream, tokens: TokenStream) -> TokenStream {
-    attr_impl::opaque(attr, tokens)
-}
-
-#[proc_macro_attribute]
-pub fn trusted(attr: TokenStream, tokens: TokenStream) -> TokenStream {
-    attr_impl::trusted(attr, tokens)
-}
-
-#[proc_macro]
-pub fn flux(tokens: TokenStream) -> TokenStream {
-    flux_attrs::flux(tokens.into()).into()
-}
-
-#[proc_macro]
-pub fn defs(tokens: TokenStream) -> TokenStream {
-    attr_impl::defs(tokens)
-}
-
-#[proc_macro_attribute]
-pub fn extern_spec(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
-    attr_impl::extern_spec(attrs, tokens)
-}
-
-#[cfg(flux_sysroot)]
-mod attr_sysroot {
-    use super::*;
-
-    pub fn extern_spec(attr: TokenStream, tokens: TokenStream) -> TokenStream {
-        flux_attrs::extern_spec(attr.into(), tokens.into()).into()
-    }
-
-    pub fn refined_by(attr: TokenStream, item: TokenStream) -> TokenStream {
-        flux_attrs::refined_by(attr.into(), item.into()).into()
-    }
-
-    pub fn defs(tokens: TokenStream) -> TokenStream {
-        flux_attrs::defs(tokens.into()).into()
-    }
-
-    macro_rules! flux_tool_attrs {
-        ($($name:ident),+ $(,)?) => {
-            $(
-            pub fn $name(attr: TokenStream, item: TokenStream) -> TokenStream {
-                flux_attrs::flux_tool_item_attr(stringify!($name), attr.into(), item.into()).into()
-            }
-            )*
-        };
-    }
-
-    flux_tool_attrs!(alias, sig, qualifiers, constant, invariant, opaque, trusted);
-}
-
-#[cfg(not(flux_sysroot))]
-mod attr_dummy {
-    use super::*;
-
-    pub fn refined_by(attr: TokenStream, item: TokenStream) -> TokenStream {
-        flux_attrs::refined_by(attr.into(), item.into()).into()
-    }
-
-    pub fn defs(_tokens: TokenStream) -> TokenStream {
-        TokenStream::new()
-    }
-
-    macro_rules! no_op {
-        ($($name:ident),+ $(,)?) => {
-            $(
-            pub fn $name(_attr: TokenStream, item: TokenStream) -> TokenStream {
-                item
-            }
-            )+
-        };
-    }
-
-    no_op!(alias, sig, qualifiers, invariant, constant, opaque, trusted, extern_spec);
+pub mod macros {
+    /// Macro for creating detached specifications.
+    ///
+    /// # Example
+    /// ```
+    /// flux_rs::macros::detached_spec! {
+    ///     fn inc(n:i32) -> i32[n+1];
+    ///     fn watermelon(n:usize) -> usize[n+2];
+    /// }
+    /// ```
+    pub use crate::__private_detached_spec as detached_spec;
+    /// Macro for creating `invariant qualifier`s
+    /// # Example
+    /// ```
+    /// flux_rs::macros::invariant!(res: int, i: int, n: int ; res + i == n);
+    /// ```
+    pub use crate::__private_invariant as invariant;
+    /// Macro for creating a local `invariant qualifier` hint.
+    /// # Example
+    /// ```
+    /// flux_rs::macros::qualifier!(my_plus(res, i) == n);
+    /// flux_rs::macros::qualifier!(res: int, i: int ; res + i == n);
+    /// ```
+    pub use crate::__private_qualifier as qualifier;
 }

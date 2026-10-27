@@ -1,133 +1,189 @@
-#![feature(rustc_private, never_type)]
+#![feature(rustc_private)]
 
 extern crate rustc_data_structures;
 extern crate rustc_errors;
 extern crate rustc_session;
 extern crate rustc_span;
 
-use std::sync::Arc;
+use std::{cell::Cell, io, sync::Arc};
 
+use flux_common::result::{ErrorCollector, ErrorEmitter};
 use rustc_data_structures::sync;
 pub use rustc_errors::ErrorGuaranteed;
 use rustc_errors::{
-    annotate_snippet_emitter_writer::AnnotateSnippetEmitterWriter,
-    emitter::{Emitter, EmitterWriter, HumanReadableErrorType},
+    Diagnostic, ErrCode, FatalError, TerminalUrl,
+    annotate_snippet_emitter_writer::AnnotateSnippetEmitter,
+    emitter::{Emitter, HumanReadableErrorType, OutputTheme, stderr_destination},
     json::JsonEmitter,
-    registry::Registry,
-    DiagnosticId, IntoDiagnostic, LazyFallbackBundle,
 };
-use rustc_session::{
-    config::{self, ErrorOutputType},
-    parse::ParseSess,
-};
+use rustc_session::{config, parse::ParseSess};
 use rustc_span::source_map::SourceMap;
 
 pub struct FluxSession {
     pub parse_sess: ParseSess,
 }
 
-pub fn diagnostic_id() -> DiagnosticId {
-    DiagnosticId::Error("FLUX".to_string())
-}
+// FIXME(nilehmann) We probably need to move out of this error reporting
+pub const E0999: ErrCode = ErrCode::from_u32(999);
 
 impl FluxSession {
-    pub fn new(
-        opts: &config::Options,
-        source_map: Arc<SourceMap>,
-        fallback_bundle: LazyFallbackBundle,
-    ) -> Self {
-        let emitter = emitter(opts, source_map.clone(), fallback_bundle);
-        let handler = rustc_errors::Handler::with_emitter(emitter);
-        Self { parse_sess: ParseSess::with_span_handler(handler, source_map) }
+    pub fn new(opts: &config::Options, source_map: Arc<SourceMap>) -> Self {
+        let emitter = emitter(opts, source_map.clone());
+        let dcx = rustc_errors::DiagCtxt::new(emitter);
+        Self { parse_sess: ParseSess::with_dcx(dcx, source_map) }
+    }
+
+    pub fn err_count(&self) -> usize {
+        self.parse_sess.dcx().err_count()
     }
 
     #[track_caller]
-    pub fn emit_err<'a>(&'a self, err: impl IntoDiagnostic<'a>) -> ErrorGuaranteed {
-        self.parse_sess.emit_err(err)
+    pub fn emit_err<'a>(&'a self, err: impl Diagnostic<'a>) -> ErrorGuaranteed {
+        self.parse_sess.dcx().emit_err(err)
     }
 
     #[track_caller]
-    pub fn emit_fatal<'a>(&'a self, fatal: impl IntoDiagnostic<'a, !>) -> ! {
-        self.parse_sess.emit_fatal(fatal)
+    pub fn emit_fatal<'a>(&'a self, fatal: impl Diagnostic<'a>) -> ! {
+        self.parse_sess.dcx().emit_fatal(fatal)
+    }
+
+    pub fn abort(&self, _: ErrorGuaranteed) -> ! {
+        self.parse_sess.dcx().abort_if_errors();
+        FatalError.raise()
     }
 
     pub fn abort_if_errors(&self) {
-        self.parse_sess.span_diagnostic.abort_if_errors();
+        self.parse_sess.dcx().abort_if_errors();
     }
 
     pub fn finish_diagnostics(&self) {
-        self.parse_sess
-            .span_diagnostic
-            .print_error_count(&Registry::new(&[]));
+        self.parse_sess.dcx().print_error_count();
         self.abort_if_errors();
     }
 
-    pub fn diagnostic(&self) -> &rustc_errors::Handler {
-        &self.parse_sess.span_diagnostic
+    pub fn dcx(&self) -> rustc_errors::DiagCtxtHandle<'_> {
+        self.parse_sess.dcx()
     }
 }
 
 fn emitter(
-    opts: &config::Options,
+    sopts: &config::Options,
     source_map: Arc<SourceMap>,
-    fallback_bundle: LazyFallbackBundle,
 ) -> Box<dyn Emitter + sync::DynSend> {
-    let bundle = None;
-    let track_diagnostics = opts.unstable_opts.track_diagnostics;
-
-    match opts.error_format {
-        ErrorOutputType::HumanReadable(kind) => {
-            let (short, color_config) = kind.unzip();
-            if let HumanReadableErrorType::AnnotateSnippet(_) = kind {
-                let emitter = AnnotateSnippetEmitterWriter::new(
-                    Some(source_map),
-                    None,
-                    fallback_bundle,
-                    short,
-                    false,
-                );
-                Box::new(emitter)
-            } else {
-                let emitter = EmitterWriter::stderr(color_config, fallback_bundle)
-                    .sm(Some(source_map))
-                    .short_message(short)
-                    .track_diagnostics(track_diagnostics)
-                    .terminal_url(opts.unstable_opts.terminal_urls);
-                Box::new(emitter)
+    // All the code below is copied from rustc_session::session::default_emitter
+    let macro_backtrace = sopts.unstable_opts.macro_backtrace;
+    let track_diagnostics = sopts.unstable_opts.track_diagnostics;
+    let terminal_url = match sopts.unstable_opts.terminal_urls {
+        TerminalUrl::Auto => {
+            match (std::env::var("COLORTERM").as_deref(), std::env::var("TERM").as_deref()) {
+                (Ok("truecolor"), Ok("xterm-256color"))
+                    if sopts.unstable_features.is_nightly_build() =>
+                {
+                    TerminalUrl::Yes
+                }
+                _ => TerminalUrl::No,
             }
         }
-        ErrorOutputType::Json { pretty, json_rendered } => {
-            Box::new(JsonEmitter::stderr(
-                Some(Registry::new(&[])),
-                source_map,
-                bundle,
-                fallback_bundle,
-                pretty,
-                json_rendered,
-                None,
-                false,
-                track_diagnostics,
-                opts.unstable_opts.terminal_urls,
-            ))
+        t => t,
+    };
+
+    let source_map = if sopts.unstable_opts.link_only { None } else { Some(source_map) };
+
+    match sopts.error_format {
+        config::ErrorOutputType::HumanReadable { kind, color_config } => {
+            match kind {
+                HumanReadableErrorType { short, unicode } => {
+                    let emitter = AnnotateSnippetEmitter::new(stderr_destination(color_config))
+                        .sm(source_map)
+                        .short_message(short)
+                        .diagnostic_width(sopts.diagnostic_width)
+                        .macro_backtrace(macro_backtrace)
+                        .track_diagnostics(track_diagnostics)
+                        .terminal_url(terminal_url)
+                        .theme(if unicode { OutputTheme::Unicode } else { OutputTheme::Ascii })
+                        .ignored_directories_in_source_blocks(
+                            sopts
+                                .unstable_opts
+                                .ignore_directory_in_diagnostics_source_blocks
+                                .clone(),
+                        );
+                    Box::new(emitter.ui_testing(sopts.unstable_opts.ui_testing))
+                }
+            }
+        }
+        config::ErrorOutputType::Json { pretty, json_rendered, color_config } => {
+            Box::new(
+                JsonEmitter::new(
+                    Box::new(io::BufWriter::new(io::stderr())),
+                    source_map,
+                    pretty,
+                    json_rendered,
+                    color_config,
+                )
+                .ui_testing(sopts.unstable_opts.ui_testing)
+                .ignored_directories_in_source_blocks(
+                    sopts
+                        .unstable_opts
+                        .ignore_directory_in_diagnostics_source_blocks
+                        .clone(),
+                )
+                .diagnostic_width(sopts.diagnostic_width)
+                .macro_backtrace(macro_backtrace)
+                .track_diagnostics(track_diagnostics)
+                .terminal_url(terminal_url),
+            )
         }
     }
 }
 
-pub trait ResultExt<T, E> {
-    #[track_caller]
-    fn emit<'a>(self, sess: &'a FluxSession) -> Result<T, ErrorGuaranteed>
-    where
-        E: IntoDiagnostic<'a>;
+impl ErrorEmitter for FluxSession {
+    fn emit<'a>(&'a self, err: impl Diagnostic<'a>) -> ErrorGuaranteed {
+        self.emit_err(err)
+    }
 }
 
-impl<T, E> ResultExt<T, E> for Result<T, E> {
-    fn emit<'a>(self, sess: &'a FluxSession) -> Result<T, ErrorGuaranteed>
-    where
-        E: IntoDiagnostic<'a>,
-    {
-        match self {
-            Ok(v) => Ok(v),
-            Err(err) => Err(sess.emit_err(err)),
-        }
+/// Convenience struct implementing [`ErrorEmitter`] and [`ErrorCollector`]
+pub struct Errors<'sess> {
+    sess: &'sess FluxSession,
+    err: Cell<Option<ErrorGuaranteed>>,
+}
+
+impl<'sess> Errors<'sess> {
+    pub fn new(sess: &'sess FluxSession) -> Self {
+        Self { sess, err: Cell::new(None) }
+    }
+
+    pub fn has_errors(&self) -> bool {
+        self.err.get().is_some()
+    }
+
+    #[track_caller]
+    pub fn emit<'a>(&'a self, err: impl Diagnostic<'a>) -> ErrorGuaranteed {
+        let err = self.sess.emit_err(err);
+        self.err.set(Some(err));
+        err
+    }
+
+    pub fn to_result(&self) -> Result<(), ErrorGuaranteed> {
+        if let Some(err) = self.err.get() { Err(err) } else { Ok(()) }
+    }
+}
+
+impl ErrorEmitter for Errors<'_> {
+    #[track_caller]
+    fn emit<'a>(&'a self, err: impl Diagnostic<'a>) -> ErrorGuaranteed {
+        Errors::emit(self, err)
+    }
+}
+
+impl ErrorCollector<ErrorGuaranteed> for Errors<'_> {
+    type Result = Result<(), ErrorGuaranteed>;
+
+    fn collect(&mut self, err: ErrorGuaranteed) {
+        *self.err.get_mut() = Some(err);
+    }
+
+    fn into_result(self) -> Self::Result {
+        Errors::to_result(&self)
     }
 }

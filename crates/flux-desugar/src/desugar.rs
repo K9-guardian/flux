@@ -1,676 +1,660 @@
-mod env;
-mod gather;
-use std::iter;
+mod lift;
 
-use flux_common::{bug, index::IndexGen, iter::IterExt, span_bug};
-use flux_errors::FluxSession;
-use flux_middle::{
-    fhir::{self, lift::LiftCtxt, ExprKind, FhirId, FluxOwnerId, Res},
-    global_env::GlobalEnv,
+use std::{iter, ops::Range};
+
+use flux_common::{
+    bug, dbg,
+    index::IndexGen,
+    iter::IterExt,
+    result::{ErrorCollector, ErrorEmitter},
+    span_bug,
 };
-use flux_syntax::surface;
-use hir::{def::DefKind, ItemKind};
-use itertools::Itertools;
-use rustc_data_structures::unord::UnordMap;
-use rustc_errors::{ErrorGuaranteed, IntoDiagnostic};
-use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir as hir;
-use rustc_hir::OwnerId;
+use flux_config as config;
+use flux_errors::{Errors, FluxSession};
+use flux_middle::{
+    ResolverOutput,
+    def_id::{FluxLocalDefId, MaybeExternId},
+    fhir::{self, FhirId, FluxOwnerId, Namespace, PartialRes, QPathExpr, Res},
+    global_env::GlobalEnv,
+    query_bug,
+    rty::QualifierKind,
+    try_alloc_slice,
+};
+use flux_syntax::{
+    surface::{self, ConstructorArg, NodeId, visit::Visitor as _},
+    symbols::{kw, sym},
+    walk_list,
+};
+use hir::{ItemKind, def::DefKind};
+use itertools::{Either, Itertools};
+use rustc_ast::ast;
+use rustc_data_structures::{fx::FxIndexSet, unord::UnordSet};
+use rustc_errors::{Diagnostic, ErrorGuaranteed};
+use rustc_hir::{self as hir, OwnerId};
 use rustc_span::{
-    def_id::LocalDefId,
-    sym::{self},
-    symbol::kw,
-    Span, Symbol,
+    DUMMY_SP, Span,
+    def_id::{DefId, LocalDefId},
 };
 
 type Result<T = ()> = std::result::Result<T, ErrorGuaranteed>;
 
-use self::env::{Scope, ScopeId};
-use crate::{
-    errors,
-    resolver::ResolverOutput,
-    sort_resolver::{SelfRes, SortResolver, SORTS},
-};
+use crate::errors;
 
-pub fn desugar_qualifier(
-    genv: &GlobalEnv,
-    qualifier: &surface::Qualifier,
-) -> Result<fhir::Qualifier> {
-    let sort_params = &[];
-    let sort_resolver =
-        SortResolver::with_sort_params(genv.sess, genv.map().sort_decls(), sort_params);
-
-    let mut env = Env::from_params(genv, &sort_resolver, ScopeId::FluxItem, &qualifier.args)?;
-
-    let cx = FluxItemCtxt::new(genv, qualifier.name.name);
-    let expr = cx.desugar_expr(&mut env, &qualifier.expr);
-
-    Ok(fhir::Qualifier {
-        name: qualifier.name.name,
-        args: env.into_root().into_params(&cx),
-        global: qualifier.global,
-        expr: expr?,
-    })
-}
-
-pub fn desugar_defn(genv: &GlobalEnv, defn: surface::FuncDef) -> Result<Option<fhir::Defn>> {
-    if let Some(body) = defn.body {
-        let sort_params = defn.sort_vars.iter().map(|ident| ident.name).collect_vec();
-        let sort_resolver =
-            SortResolver::with_sort_params(genv.sess, genv.map().sort_decls(), &sort_params);
-        let mut env = Env::from_params(genv, &sort_resolver, ScopeId::FluxItem, &defn.args)?;
-
-        let cx = FluxItemCtxt::new(genv, defn.name.name);
-        let expr = cx.desugar_expr(&mut env, &body)?;
-        let name = defn.name.name;
-        let params = defn.sort_vars.len();
-        let sort = sort_resolver.resolve_sort(&defn.output)?;
-        let args = env.into_root().into_params(&cx);
-
-        Ok(Some(fhir::Defn { name, params, args, sort, expr }))
-    } else {
-        Ok(None)
+/// Collect all sorts resolved to a generic type in a list of refinement parameters. Return the set
+/// of generic def_ids used (sorted by their position in the list of generics).
+fn collect_generics_in_params(
+    genv: GlobalEnv,
+    owner: MaybeExternId<OwnerId>,
+    resolver_output: &ResolverOutput,
+    params: &surface::RefineParams,
+) -> FxIndexSet<DefId> {
+    struct ParamCollector<'a> {
+        resolver_output: &'a ResolverOutput,
+        found: UnordSet<DefId>,
     }
-}
-
-pub fn func_def_to_func_decl(
-    sess: &FluxSession,
-    sort_decls: &fhir::SortDecls,
-    defn: &surface::FuncDef,
-) -> Result<fhir::FuncDecl> {
-    let params = defn.sort_vars.len();
-    let sort_vars = defn.sort_vars.iter().map(|ident| ident.name).collect_vec();
-    let sr = SortResolver::with_sort_params(sess, sort_decls, &sort_vars);
-    let inputs: Vec<fhir::Sort> = defn
-        .args
-        .iter()
-        .map(|arg| sr.resolve_sort(&arg.sort))
-        .try_collect_exhaust()?;
-    let output = sr.resolve_sort(&defn.output)?;
-    let sort = fhir::PolyFuncSort::new(params, inputs, output);
-    let kind = if defn.body.is_some() { fhir::FuncKind::Def } else { fhir::FuncKind::Uif };
-    Ok(fhir::FuncDecl { name: defn.name.name, sort, kind })
-}
-
-fn gather_refined_by_sort_vars(
-    generics: &rustc_middle::ty::Generics,
-    refined_by: &surface::RefinedBy,
-) -> Vec<Symbol> {
-    struct IdentCollector {
-        found: FxHashSet<Symbol>,
-    }
-    impl surface::visit::Visitor for IdentCollector {
+    impl surface::visit::Visitor<'_> for ParamCollector<'_> {
         fn visit_base_sort(&mut self, bsort: &surface::BaseSort) {
-            if let surface::BaseSort::Ident(x) = bsort {
-                self.found.insert(x.name);
+            if let surface::BaseSort::Path(path) = bsort {
+                let res = self.resolver_output.path_res_map[&path.node_id];
+                if let fhir::Res::Def(DefKind::TyParam, def_id) = res.base_res() {
+                    self.found.insert(def_id);
+                }
             }
             surface::visit::walk_base_sort(self, bsort);
         }
     }
-    let mut vis = IdentCollector { found: FxHashSet::default() };
-    surface::visit::Visitor::visit_refined_by(&mut vis, refined_by);
-    generics
-        .params
+    let mut vis = ParamCollector { resolver_output, found: UnordSet::new() };
+    walk_list!(vis, visit_refine_param, params);
+    genv.tcx()
+        .generics_of(owner.resolved_id())
+        .own_params
         .iter()
-        .filter_map(|param| if vis.found.contains(&param.name) { Some(param.name) } else { None })
+        .filter_map(
+            |param| if vis.found.contains(&param.def_id) { Some(param.def_id) } else { None },
+        )
         .collect()
 }
 
-pub fn desugar_refined_by(
-    sess: &FluxSession,
-    sort_decls: &fhir::SortDecls,
-    owner_id: OwnerId,
-    generics: &rustc_middle::ty::Generics,
-    refined_by: &surface::RefinedBy,
-) -> Result<fhir::RefinedBy> {
-    let sort_vars = gather_refined_by_sort_vars(generics, refined_by);
-    let sr = SortResolver::with_sort_params(sess, sort_decls, &sort_vars);
-
-    let index_params: Vec<_> = refined_by
-        .index_params
-        .iter()
-        .map(|param| Ok((param.name.name, sr.resolve_sort(&param.sort)?)))
-        .try_collect_exhaust()?;
-
-    let generic_idx: FxHashMap<Symbol, hir::def_id::DefId> = generics
-        .params
-        .iter()
-        .map(|param| (param.name, param.def_id))
-        .collect();
-    let sort_params = sort_vars.iter().map(|sym| generic_idx[&sym]).collect();
-
-    Ok(fhir::RefinedBy::new(owner_id.def_id, index_params, sort_params, refined_by.span))
-}
-
-pub(crate) struct RustItemCtxt<'a, 'tcx> {
-    genv: &'a GlobalEnv<'a, 'tcx>,
-    local_id_gen: IndexGen<fhir::ItemLocalId>,
-    owner: OwnerId,
-    resolver_output: &'a ResolverOutput,
-    opaque_tys: Option<&'a mut UnordMap<LocalDefId, fhir::OpaqueTy>>,
-    sort_resolver: SortResolver<'a>,
-}
-
-type Env = env::Env<Param>;
-
-#[derive(Debug, Clone)]
-struct Param {
-    name: fhir::Name,
-    sort: fhir::Sort,
-    kind: fhir::ParamKind,
-    span: Span,
-}
-
-struct FluxItemCtxt<'a, 'tcx> {
-    genv: &'a GlobalEnv<'a, 'tcx>,
-    local_id_gen: IndexGen<fhir::ItemLocalId>,
-    owner: Symbol,
-}
-
-enum FuncRes<'a> {
-    Param(fhir::Ident),
-    Global(&'a fhir::FuncDecl),
-}
-
-enum QPathRes<'a> {
-    Param(fhir::Ident),
-    Const(&'a fhir::ConstInfo),
-    NumConst(i128),
-}
-
-fn self_res(genv: &GlobalEnv, owner: OwnerId) -> SelfRes {
-    let def_id = owner.def_id.to_def_id();
-    let mut opt_def_id = Some(def_id);
-    while let Some(def_id) = opt_def_id {
-        match genv.tcx.def_kind(def_id) {
-            DefKind::Trait => return SelfRes::Param { trait_id: def_id },
-            DefKind::Impl { .. } => return SelfRes::Alias { alias_to: def_id },
-            _ => {
-                opt_def_id = genv.tcx.opt_parent(def_id);
+/// Collect the spans of every hole (`_`) inside a qualified path `<qself as path>`.
+fn collect_holes(qself: &surface::Ty, path: &surface::Path) -> Vec<Span> {
+    struct HoleCollector {
+        holes: Vec<Span>,
+    }
+    impl surface::visit::Visitor<'_> for HoleCollector {
+        fn visit_ty(&mut self, ty: &surface::Ty) {
+            if let surface::TyKind::Hole = ty.kind {
+                self.holes.push(ty.span);
             }
+            surface::visit::walk_ty(self, ty);
+        }
+
+        fn visit_const_arg(&mut self, const_arg: &surface::ConstArg) {
+            if let surface::ConstArgKind::Infer = const_arg.kind {
+                self.holes.push(const_arg.span);
+            }
+            surface::visit::walk_const_arg(self, const_arg);
         }
     }
-    SelfRes::None
+    let mut vis = HoleCollector { holes: vec![] };
+    vis.visit_ty(qself);
+    vis.visit_path(path);
+    vis.holes
 }
 
-impl<'a, 'tcx> RustItemCtxt<'a, 'tcx> {
-    pub(crate) fn new(
-        genv: &'a GlobalEnv<'a, 'tcx>,
-        owner: OwnerId,
-        resolver_output: &'a ResolverOutput,
-        opaque_tys: Option<&'a mut UnordMap<LocalDefId, fhir::OpaqueTy>>,
-    ) -> RustItemCtxt<'a, 'tcx> {
-        let generics = genv.tcx.generics_of(owner);
-        let self_res = self_res(genv, owner);
-        let sort_resolver =
-            SortResolver::with_generics(genv.sess, genv.map().sort_decls(), generics, self_res);
-        RustItemCtxt {
+pub(crate) struct RustItemCtxt<'a, 'genv, 'tcx> {
+    genv: GlobalEnv<'genv, 'tcx>,
+    local_id_gen: IndexGen<fhir::ItemLocalId>,
+    owner: MaybeExternId<OwnerId>,
+    fn_sig_scope: Option<NodeId>,
+    resolver_output: &'genv ResolverOutput,
+    /// HACK! We assume there's at most one opaque type (we fail with an error if there's more than one)
+    /// and we store the `DefId` here if it exists. See [`collect_opaque_types`]
+    opaque: Option<LocalDefId>,
+    /// This collects all the opaque types generated in the process of desugaring an `FnSig`, however
+    /// we can only resolve one opaque type so this will contain at most one element.
+    opaque_tys: Option<&'a mut Vec<&'genv fhir::OpaqueTy<'genv>>>,
+    errors: Errors<'genv>,
+}
+
+impl<'a, 'genv, 'tcx: 'genv> RustItemCtxt<'a, 'genv, 'tcx> {
+    pub(crate) fn with<T>(
+        genv: GlobalEnv<'genv, 'tcx>,
+        owner: MaybeExternId<OwnerId>,
+        resolver_output: &'genv ResolverOutput,
+        opaque_tys: Option<&'a mut Vec<&'genv fhir::OpaqueTy<'genv>>>,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let mut cx = RustItemCtxt {
             genv,
             owner,
+            fn_sig_scope: None,
             local_id_gen: IndexGen::new(),
-            sort_resolver,
             resolver_output,
             opaque_tys,
-        }
-    }
-
-    fn with_new_owner<'b>(&'b mut self, owner: OwnerId) -> RustItemCtxt<'b, 'tcx> {
-        RustItemCtxt::new(self.genv, owner, self.resolver_output, self.opaque_tys.as_deref_mut())
-    }
-
-    fn as_lift_cx<'b>(&'b mut self) -> LiftCtxt<'b, 'tcx> {
-        LiftCtxt::new(
-            self.genv.tcx,
-            self.genv.sess,
-            self.owner,
-            &self.local_id_gen,
-            self.opaque_tys.as_deref_mut(),
-        )
-    }
-
-    pub(crate) fn desugar_trait(&mut self, trait_: &surface::Trait) -> Result<fhir::Trait> {
-        let mut env = Env::new(ScopeId::Misc);
-        let generics = if let Some(generics) = &trait_.generics {
-            self.desugar_generics(generics, &mut env)?
-        } else {
-            self.as_lift_cx().lift_generics()?
+            errors: Errors::new(genv.sess()),
+            opaque: collect_opaque_types(genv, owner)?,
         };
-        let assoc_predicates = self.desugar_trait_assoc_predicates(&trait_.assoc_predicates)?;
-        Ok(fhir::Trait { generics, assoc_predicates })
+        let r = f(&mut cx)?;
+        cx.into_result()?;
+        Ok(r)
     }
 
-    fn desugar_trait_assoc_predicates(
-        &self,
-        assoc_predicates: &[surface::TraitAssocPredicate],
-    ) -> Result<Vec<fhir::TraitAssocPredicate>> {
-        assoc_predicates
-            .iter()
-            .map(|assoc_pred| {
-                let name = assoc_pred.name.name;
-                let sort = self.sort_resolver.resolve_sort(&assoc_pred.sort)?;
-                if let fhir::Sort::Func(func_sort) = sort
-                    && let fhir::Sort::Bool = func_sort.fsort.output()
-                    && func_sort.params == 0
-                {
-                    Ok(fhir::TraitAssocPredicate {
-                        name,
-                        sorts: func_sort.fsort.inputs().to_vec(),
-                        span: assoc_pred.span,
-                    })
-                } else {
-                    Err(self.emit_err(errors::InvalidAssocPredicate::new(assoc_pred.span, name)))
-                }
-            })
-            .try_collect_exhaust()
-    }
-
-    pub(crate) fn desugar_impl(&mut self, impl_: &surface::Impl) -> Result<fhir::Impl> {
-        let mut env = Env::new(ScopeId::Misc);
-        let generics = if let Some(generics) = &impl_.generics {
-            self.desugar_generics(generics, &mut env)?
-        } else {
-            self.as_lift_cx().lift_generics()?
-        };
-        let assoc_predicates = self.desugar_impl_assoc_predicates(&impl_.assoc_predicates)?;
-        Ok(fhir::Impl { generics, assoc_predicates })
-    }
-
-    fn desugar_impl_assoc_predicates(
-        &self,
-        assoc_predicates: &[surface::ImplAssocPredicate],
-    ) -> Result<Vec<fhir::ImplAssocPredicate>> {
-        assoc_predicates
-            .iter()
-            .map(|assoc_pred| {
-                let name = assoc_pred.name.name;
-                let mut env = Env::from_params(
-                    self.genv,
-                    &self.sort_resolver,
-                    ScopeId::Misc,
-                    &assoc_pred.params,
-                )?;
-                let body = self.desugar_expr(&mut env, &assoc_pred.body)?;
-                let params = env.into_root().into_params(self);
-                Ok(fhir::ImplAssocPredicate { name, params, body, span: assoc_pred.span })
-            })
-            .try_collect_exhaust()
-    }
-
-    /// [desugar_generics] starts with the `lifted_generics` and "updates" it with the surface `generics`
-    fn desugar_generics(
-        &mut self,
-        generics: &surface::Generics,
-        env: &mut Env,
-    ) -> Result<fhir::Generics> {
-        // Step 1: desugar the surface generics by themselves
-        let generics = self.desugar_surface_generics(generics, env)?;
-
-        // Step 2: map each (surface) generic to its specified kind
-        let generic_kinds: FxHashMap<_, _> = generics
-            .params
-            .into_iter()
-            .map(|param| (param.def_id, param.kind))
-            .collect();
-
-        // Step 3: traverse lifted_generics, using the surface-kind, if specified, and lifted kind otherwise
-        let lifted_generics = self.as_lift_cx().lift_generics()?;
-        let params = lifted_generics
-            .params
-            .iter()
-            .map(|lifted_param| {
-                let def_id = lifted_param.def_id;
-                let kind = generic_kinds.get(&def_id).unwrap_or(&lifted_param.kind);
-                fhir::GenericParam { def_id, kind: kind.clone() }
-            })
-            .collect();
-
-        Ok(fhir::Generics { params, ..generics })
-    }
-
-    fn desugar_surface_generics(
-        &mut self,
-        generics: &surface::Generics,
-        env: &mut Env,
-    ) -> Result<fhir::Generics> {
-        let hir_generics = self.genv.hir().get_generics(self.owner.def_id).unwrap();
-        let generics_map: FxHashMap<_, _> = hir_generics
-            .params
-            .iter()
-            .flat_map(|param| {
-                if let hir::ParamName::Plain(name) = param.name {
-                    Some((name, param.def_id))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let mut params = vec![];
-        let mut self_kind = None;
-        for param in &generics.params {
-            let kind = match &param.kind {
-                surface::GenericParamKind::Type => fhir::GenericParamKind::Type { default: None },
-                surface::GenericParamKind::Base => fhir::GenericParamKind::BaseTy,
-                surface::GenericParamKind::Spl => fhir::GenericParamKind::SplTy,
-                surface::GenericParamKind::Refine { .. } => {
-                    continue;
-                }
-            };
-
-            if param.name.name == kw::SelfUpper {
-                self_kind = Some(kind);
-            } else {
-                let def_id = *generics_map.get(&param.name).ok_or_else(|| {
-                    self.emit_err(errors::UnresolvedGenericParam::new(param.name))
-                })?;
-                params.push(fhir::GenericParam { def_id, kind });
+    pub(crate) fn desugar_item(&mut self, item: &surface::Item) -> Result<fhir::Item<'genv>> {
+        match &item.kind {
+            surface::ItemKind::Fn(fn_sig) => {
+                let (generics, fn_sig) = self.desugar_fn_sig(fn_sig.as_ref())?;
+                Ok(fhir::Item { generics, kind: fhir::ItemKind::Fn(fn_sig), owner_id: self.owner })
             }
+            surface::ItemKind::Struct(struct_def) => Ok(self.desugar_struct_def(struct_def)),
+            surface::ItemKind::Enum(enum_def) => self.desugar_enum_def(enum_def),
+            surface::ItemKind::Trait(trait_) => self.desugar_trait(trait_),
+            surface::ItemKind::Impl(impl_) => Ok(self.desugar_impl(impl_)),
+            surface::ItemKind::Const(constant_info) => Ok(self.desugar_const(constant_info)),
+            surface::ItemKind::Static(static_info) => Ok(self.desugar_static(static_info)),
+            surface::ItemKind::TyAlias(ty_alias) => Ok(self.desugar_type_alias(ty_alias)),
+            surface::ItemKind::Mod => Err(self.emit(query_bug!("modules can't be desugared"))),
         }
-        let predicates = self.desugar_generic_predicates(&generics.predicates, env)?;
-        Ok(fhir::Generics { params, self_kind, refinement_params: vec![], predicates })
+    }
+
+    pub(crate) fn desugar_trait_item(
+        &mut self,
+        item: &surface::TraitItemFn,
+    ) -> Result<fhir::TraitItem<'genv>> {
+        let (generics, fn_sig) = self.desugar_fn_sig(item.sig.as_ref())?;
+        Ok(fhir::TraitItem {
+            generics,
+            kind: fhir::TraitItemKind::Fn(fn_sig),
+            owner_id: self.owner,
+        })
+    }
+
+    pub(crate) fn desugar_impl_item(
+        &mut self,
+        item: &surface::ImplItemFn,
+    ) -> Result<fhir::ImplItem<'genv>> {
+        let (generics, fn_sig) = self.desugar_fn_sig(item.sig.as_ref())?;
+        Ok(fhir::ImplItem { generics, kind: fhir::ImplItemKind::Fn(fn_sig), owner_id: self.owner })
+    }
+
+    fn desugar_trait(&mut self, trait_: &surface::Trait) -> Result<fhir::Item<'genv>> {
+        let generics = if let Some(generics) = &trait_.generics {
+            self.desugar_generics(generics)
+        } else {
+            self.lift_generics()
+        };
+        let assoc_refinements = self.desugar_trait_assoc_refts(&trait_.assoc_refinements)?;
+        let trait_ = fhir::Trait { assoc_refinements };
+
+        if config::dump_fhir() {
+            dbg::dump_item_info(self.genv.tcx(), self.owner.local_id(), "fhir", &trait_).unwrap();
+        }
+
+        Ok(fhir::Item { generics, kind: fhir::ItemKind::Trait(trait_), owner_id: self.owner })
+    }
+
+    fn desugar_trait_assoc_refts(
+        &mut self,
+        assoc_refts: &[surface::TraitAssocReft],
+    ) -> Result<&'genv [fhir::TraitAssocReft<'genv>]> {
+        let iter = assoc_refts
+            .iter()
+            .map(|assoc_reft| {
+                let name = assoc_reft.name.name;
+                let params = self.desugar_refine_params(&assoc_reft.params);
+                let output = self.desugar_base_sort(&assoc_reft.output, None);
+                let body = assoc_reft.body.as_ref().map(|expr| self.desugar_expr(expr));
+                if body.is_none() && assoc_reft.final_ {
+                    Err(self.emit(errors::FinalAssocReftWithoutBody::new(assoc_reft.span)))
+                } else {
+                    Ok(fhir::TraitAssocReft {
+                        name,
+                        params,
+                        output,
+                        body,
+                        span: assoc_reft.span,
+                        final_: assoc_reft.final_,
+                    })
+                }
+            })
+            .try_collect_vec()?
+            .into_iter();
+        Ok(self.genv().alloc_slice_fill_iter(iter))
+    }
+
+    fn desugar_impl(&mut self, impl_: &surface::Impl) -> fhir::Item<'genv> {
+        let generics = if let Some(generics) = &impl_.generics {
+            self.desugar_generics(generics)
+        } else {
+            self.lift_generics()
+        };
+        let assoc_refinements = self.desugar_impl_assoc_refts(&impl_.assoc_refinements);
+        let impl_ = fhir::Impl { assoc_refinements };
+
+        if config::dump_fhir() {
+            dbg::dump_item_info(self.genv.tcx(), self.owner.local_id(), "fhir", &impl_).unwrap();
+        }
+
+        fhir::Item { generics, kind: fhir::ItemKind::Impl(impl_), owner_id: self.owner }
+    }
+
+    fn desugar_impl_assoc_refts(
+        &mut self,
+        assoc_refts: &[surface::ImplAssocReft],
+    ) -> &'genv [fhir::ImplAssocReft<'genv>] {
+        self.genv()
+            .alloc_slice_fill_iter(assoc_refts.iter().map(|assoc_reft| {
+                let name = assoc_reft.name.name;
+                let body = self.desugar_expr(&assoc_reft.body);
+                let params = self.desugar_refine_params(&assoc_reft.params);
+                let output = self.desugar_base_sort(&assoc_reft.output, None);
+                fhir::ImplAssocReft { name, params, output, body, span: assoc_reft.span }
+            }))
+    }
+
+    fn desugar_generics(&mut self, generics: &surface::Generics) -> fhir::Generics<'genv> {
+        let params = self.genv.alloc_slice_fill_iter(
+            self.genv
+                .tcx()
+                .hir_get_generics(self.owner.local_id().def_id)
+                .unwrap()
+                .params
+                .iter()
+                .map(|hir_param| self.lift_generic_param(hir_param)),
+        );
+
+        let predicates = generics
+            .predicates
+            .as_ref()
+            .map(|preds| self.desugar_generic_predicates(preds));
+        fhir::Generics { params, refinement_params: &[], predicates }
+    }
+
+    fn desugar_opt_generics(
+        &mut self,
+        generics: Option<&surface::Generics>,
+    ) -> fhir::Generics<'genv> {
+        if let Some(generics) = generics {
+            self.desugar_generics(generics)
+        } else {
+            self.lift_generics()
+        }
     }
 
     fn desugar_generic_predicates(
         &mut self,
         predicates: &[surface::WhereBoundPredicate],
-        env: &mut Env,
-    ) -> Result<Vec<fhir::WhereBoundPredicate>> {
-        predicates
-            .iter()
-            .map(|pred| self.desugar_generic_predicate(pred, env))
-            .try_collect_exhaust()
-    }
-
-    fn desugar_generic_predicate(
-        &mut self,
-        pred: &surface::WhereBoundPredicate,
-        env: &mut Env,
-    ) -> Result<fhir::WhereBoundPredicate> {
-        let bounded_ty = self.desugar_ty(None, &pred.bounded_ty, env)?;
-        let bounds = self.desugar_generic_bounds(&pred.bounds, env)?;
-        Ok(fhir::WhereBoundPredicate { span: pred.span, bounded_ty, bounds })
+    ) -> &'genv [fhir::WhereBoundPredicate<'genv>] {
+        self.genv
+            .alloc_slice_fill_iter(predicates.iter().map(|pred| {
+                let bounded_ty = self.desugar_ty(&pred.bounded_ty);
+                let bounds = self.desugar_generic_bounds(&pred.bounds);
+                fhir::WhereBoundPredicate { span: pred.span, bounded_ty, bounds }
+            }))
     }
 
     fn desugar_generic_bounds(
         &mut self,
-        bounds: &surface::GenericBounds,
-        env: &mut Env,
-    ) -> Result<fhir::GenericBounds> {
-        bounds
+        bounds: &[surface::TraitRef],
+    ) -> fhir::GenericBounds<'genv> {
+        self.genv().alloc_slice_fill_iter(
+            bounds
+                .iter()
+                .map(|bound| fhir::GenericBound::Trait(self.desugar_trait_ref(bound))),
+        )
+    }
+
+    fn desugar_trait_ref(&mut self, trait_ref: &surface::TraitRef) -> fhir::PolyTraitRef<'genv> {
+        let fhir::QPath::Resolved(None, path) = self.desugar_qpath(None, &trait_ref.path) else {
+            span_bug!(trait_ref.path.span, "desugar_alias_reft: unexpected qpath")
+        };
+        let span = path.span;
+
+        let refine_params = self
+            .genv
+            .alloc_slice_fill_iter(self.implicit_params_to_params(trait_ref.node_id));
+
+        fhir::PolyTraitRef {
+            bound_generic_params: &[],
+            refine_params,
+            modifiers: fhir::TraitBoundModifier::None,
+            trait_ref: path,
+            span,
+        }
+    }
+
+    fn desugar_refined_by(&mut self, refined_by: &surface::RefineParams) -> fhir::RefinedBy<'genv> {
+        let generic_id_to_var_idx =
+            collect_generics_in_params(self.genv, self.owner, self.resolver_output, refined_by);
+
+        let fields = refined_by
             .iter()
-            .map(|bound| {
-                Ok(fhir::GenericBound::Trait(
-                    self.desugar_trait_ref(bound, env)?,
-                    fhir::TraitBoundModifier::None,
-                ))
+            .map(|param| {
+                (param.ident.name, self.desugar_sort(&param.sort, Some(&generic_id_to_var_idx)))
             })
-            .try_collect_exhaust()
+            .collect();
+
+        fhir::RefinedBy::new(fields, generic_id_to_var_idx)
     }
 
-    fn desugar_trait_ref(
-        &mut self,
-        trait_ref: &surface::TraitRef,
-        env: &mut Env,
-    ) -> Result<fhir::PolyTraitRef> {
-        Ok(fhir::PolyTraitRef {
-            bound_generic_params: vec![],
-            trait_ref: self.desugar_path(&trait_ref.path, env)?,
-        })
-    }
+    fn desugar_struct_def(&mut self, struct_def: &surface::StructDef) -> fhir::Item<'genv> {
+        let refined_by = if let Some(refined_by) = &struct_def.refined_by {
+            self.desugar_refined_by(refined_by)
+        } else {
+            fhir::RefinedBy::trivial()
+        };
 
-    pub(crate) fn desugar_struct_def(
-        &mut self,
-        struct_def: &surface::StructDef,
-    ) -> Result<fhir::StructDef> {
-        let mut env = self.gather_params_struct(struct_def)?;
+        let generics = self.desugar_opt_generics(struct_def.generics.as_ref());
 
-        let generics = self.desugar_generics_for_adt(struct_def.generics.as_ref(), &mut env)?;
-
-        let invariants = struct_def
-            .invariants
-            .iter()
-            .map(|invariant| self.desugar_expr(&mut env, invariant))
-            .try_collect_exhaust()?;
+        let invariants = self.genv().alloc_slice_fill_iter(
+            struct_def
+                .invariants
+                .iter()
+                .map(|invariant| self.desugar_expr(invariant)),
+        );
 
         let kind = if struct_def.opaque {
             fhir::StructKind::Opaque
         } else {
-            let hir::ItemKind::Struct(variant_data, _) =
-                &self.genv.hir().expect_item(self.owner.def_id).kind
-            else {
-                bug!("expected struct")
-            };
-            debug_assert_eq!(struct_def.fields.len(), variant_data.fields().len());
-            let fields = iter::zip(&struct_def.fields, variant_data.fields())
-                .map(|(ty, hir_field)| {
-                    if let Some(ty) = ty {
-                        Ok(fhir::FieldDef {
-                            ty: self.desugar_ty(None, ty, &mut env)?,
-                            def_id: hir_field.def_id,
-                            lifted: false,
-                        })
-                    } else {
-                        self.as_lift_cx().lift_field_def(hir_field)
-                    }
-                })
-                .try_collect_exhaust()?;
-            fhir::StructKind::Transparent { fields }
+            let kind = &self
+                .genv
+                .tcx()
+                .hir_expect_item(self.owner.local_id().def_id)
+                .kind;
+            match kind {
+                hir::ItemKind::Struct(_, _, variant_data)
+                | hir::ItemKind::Union(_, _, variant_data) => {
+                    debug_assert_eq!(struct_def.fields.len(), variant_data.fields().len());
+                    let fields = self.genv.alloc_slice_fill_iter(
+                        iter::zip(&struct_def.fields, variant_data.fields()).map(
+                            |(ty, hir_field)| {
+                                if let Some(ty) = ty {
+                                    fhir::FieldDef { ty: self.desugar_ty(ty), lifted: false }
+                                } else {
+                                    self.lift_field_def(hir_field)
+                                }
+                            },
+                        ),
+                    );
+                    fhir::StructKind::Transparent { fields }
+                }
+                _ => bug!("expected struct or union"),
+            }
         };
-        Ok(fhir::StructDef {
-            owner_id: self.owner,
-            generics,
-            params: env.into_root().into_params(self),
-            kind,
-            invariants,
-            extern_id: struct_def.extern_id,
-        })
+
+        let params = self.desugar_refine_params(struct_def.refined_by.as_deref().unwrap_or(&[]));
+        let refinement = fhir::RefinementKind::Refined(refined_by);
+        let struct_def =
+            fhir::StructDef { refinement: self.genv.alloc(refinement), params, kind, invariants };
+
+        if config::dump_fhir() {
+            dbg::dump_item_info(self.genv.tcx(), self.owner.local_id(), "fhir", struct_def)
+                .unwrap();
+        }
+
+        fhir::Item { generics, kind: fhir::ItemKind::Struct(struct_def), owner_id: self.owner }
     }
 
-    pub(crate) fn desugar_enum_def(
-        &mut self,
-        enum_def: &surface::EnumDef,
-    ) -> Result<fhir::EnumDef> {
-        let def_id = self.owner.def_id;
-        let ItemKind::Enum(hir_enum, _) = &self.genv.hir().expect_item(def_id).kind else {
+    fn desugar_enum_def(&mut self, enum_def: &surface::EnumDef) -> Result<fhir::Item<'genv>> {
+        let def_id = self.owner.local_id().def_id;
+        let ItemKind::Enum(_, _, hir_enum) = self.genv.tcx().hir_expect_item(def_id).kind else {
             bug!("expected enum");
         };
-        let variants = iter::zip(&enum_def.variants, hir_enum.variants)
-            .map(|(variant, hir_variant)| self.desugar_enum_variant_def(variant, hir_variant))
-            .try_collect_exhaust()?;
-
-        let mut env = Env::from_params(
+        let reflected = enum_def.reflected;
+        let variants = try_alloc_slice!(
             self.genv,
-            &self.sort_resolver,
-            ScopeId::Enum(enum_def.node_id),
-            enum_def.refined_by.iter().flat_map(|it| &it.index_params),
+            iter::zip(&enum_def.variants, hir_enum.variants),
+            |(variant, hir_variant)| self.desugar_enum_variant_def(reflected, variant, hir_variant)
         )?;
 
-        let generics = self.desugar_generics_for_adt(enum_def.generics.as_ref(), &mut env)?;
+        let kind = if enum_def.reflected {
+            fhir::RefinementKind::Reflected
+        } else if let Some(refined_by) = &enum_def.refined_by {
+            fhir::RefinementKind::Refined(self.desugar_refined_by(refined_by))
+        } else {
+            fhir::RefinementKind::Refined(fhir::RefinedBy::trivial())
+        };
 
-        let invariants = enum_def
-            .invariants
-            .iter()
-            .map(|invariant| self.desugar_expr(&mut env, invariant))
-            .try_collect_exhaust()?;
+        let generics = self.desugar_opt_generics(enum_def.generics.as_ref());
 
-        Ok(fhir::EnumDef {
-            owner_id: self.owner,
-            generics,
-            params: env.into_root().into_params(self),
-            variants,
-            invariants,
-            extern_id: enum_def.extern_id,
-        })
+        let invariants = self.genv().alloc_slice_fill_iter(
+            enum_def
+                .invariants
+                .iter()
+                .map(|invariant| self.desugar_expr(invariant)),
+        );
+
+        let params = self.desugar_refine_params(enum_def.refined_by.as_deref().unwrap_or(&[]));
+        let enum_def =
+            fhir::EnumDef { refinement: self.genv.alloc(kind), params, variants, invariants };
+
+        if config::dump_fhir() {
+            dbg::dump_item_info(self.genv.tcx(), self.owner.local_id(), "fhir", &enum_def).unwrap();
+        }
+
+        Ok(fhir::Item { generics, kind: fhir::ItemKind::Enum(enum_def), owner_id: self.owner })
     }
 
     fn desugar_enum_variant_def(
         &mut self,
+        reflected: bool,
         variant_def: &Option<surface::VariantDef>,
         hir_variant: &hir::Variant,
-    ) -> Result<fhir::VariantDef> {
+    ) -> Result<fhir::VariantDef<'genv>> {
         if let Some(variant_def) = variant_def {
-            let mut env = self.gather_params_variant(variant_def)?;
-
-            let fields = iter::zip(&variant_def.fields, hir_variant.data.fields())
-                .map(|(ty, hir_field)| {
-                    Ok(fhir::FieldDef {
-                        ty: self.desugar_ty(None, ty, &mut env)?,
-                        def_id: hir_field.def_id,
-                        lifted: false,
-                    })
-                })
-                .try_collect_exhaust()?;
+            if reflected {
+                return Err(self.emit(errors::InvalidReflectedVariant::new(hir_variant.span)));
+            }
+            let fields = self.genv.alloc_slice_fill_iter(
+                variant_def
+                    .fields
+                    .iter()
+                    .map(|ty| fhir::FieldDef { ty: self.desugar_ty(ty), lifted: false }),
+            );
 
             let ret = if let Some(ret) = &variant_def.ret {
-                self.desugar_variant_ret(ret, &mut env)?
+                self.desugar_variant_ret(ret)?
             } else {
-                self.as_lift_cx().lift_variant_ret()
+                self.lift_variant_ret()
             };
+
+            let params = self
+                .genv
+                .alloc_slice_fill_iter(self.implicit_params_to_params(variant_def.node_id));
 
             Ok(fhir::VariantDef {
                 def_id: hir_variant.def_id,
-                params: env.into_root().into_params(self),
+                params,
                 fields,
                 ret,
                 span: variant_def.span,
                 lifted: false,
             })
         } else {
-            self.as_lift_cx().lift_enum_variant(hir_variant)
+            Ok(self.lift_enum_variant(hir_variant))
         }
     }
 
-    fn desugar_generics_for_adt(
+    fn desugar_type_alias(&mut self, ty_alias: &surface::TyAlias) -> fhir::Item<'genv> {
+        let mut generics = self.desugar_generics(&ty_alias.generics);
+
+        let ty = self.desugar_ty(&ty_alias.ty);
+
+        generics.refinement_params = self.desugar_refine_params(&ty_alias.params);
+
+        let index = ty_alias
+            .index
+            .as_ref()
+            .map(|index| self.desugar_refine_param(index));
+
+        let ty_alias =
+            self.genv()
+                .alloc(fhir::TyAlias { index, ty, span: ty_alias.span, lifted: false });
+        if config::dump_fhir() {
+            dbg::dump_item_info(self.genv.tcx(), self.owner.local_id(), "fhir", ty_alias).unwrap();
+        }
+        fhir::Item { generics, kind: fhir::ItemKind::TyAlias(ty_alias), owner_id: self.owner }
+    }
+
+    fn desugar_const(&mut self, const_info: &surface::ConstantInfo) -> fhir::Item<'genv> {
+        let expr = const_info.expr.as_ref().map(|e| self.desugar_expr(e));
+        let owner_id = self.owner;
+        let generics = self.lift_generics();
+        let kind = fhir::ItemKind::Const(expr);
+        fhir::Item { owner_id, generics, kind }
+    }
+
+    fn desugar_static(&mut self, static_info: &surface::StaticInfo) -> fhir::Item<'genv> {
+        let ty = self.desugar_ty(&static_info.ty);
+        let owner_id = self.owner;
+        let generics = fhir::Generics::empty(self.genv);
+        let kind = fhir::ItemKind::Static(Some(ty));
+        fhir::Item { owner_id, generics, kind }
+    }
+
+    fn desugar_fn_sig(
         &mut self,
-        generics: Option<&surface::Generics>,
-        env: &mut Env,
-    ) -> Result<fhir::Generics> {
-        Ok(if let Some(generics) = generics {
-            self.desugar_generics(generics, env)?
+        fn_sig: Option<&surface::FnSig>,
+    ) -> Result<(fhir::Generics<'genv>, fhir::FnSig<'genv>)> {
+        let mut header = self.lift_fn_header();
+        let (generics, decl, expr) = if let Some(fn_sig) = fn_sig {
+            self.fn_sig_scope = Some(fn_sig.node_id);
+
+            let mut requires = vec![];
+
+            let mut generics = self.desugar_generics(&fn_sig.generics);
+
+            for surface_requires in &fn_sig.requires {
+                let params = self.desugar_refine_params(&surface_requires.params);
+                let pred = self.desugar_expr(&surface_requires.pred);
+                requires.push(fhir::Requires { params, pred });
+            }
+
+            // Bail out if there's an error in the arguments to avoid confusing error messages
+            let inputs = self
+                .genv()
+                .alloc_slice_fill_iter(fn_sig.inputs.iter().map(|arg| self.desugar_fn_input(arg)));
+
+            let output = self.desugar_fn_output(fn_sig.asyncness, &fn_sig.output)?;
+
+            generics.refinement_params = self.desugar_fn_sig_refine_params(fn_sig);
+
+            let decl = fhir::FnDecl {
+                requires: self.genv.alloc_slice(&requires),
+                inputs,
+                output,
+                span: fn_sig.span,
+                lifted: false,
+            };
+
+            // Fix up the span in asyncness
+            if let surface::Async::Yes { span, .. } = fn_sig.asyncness {
+                header.asyncness = hir::IsAsync::Async(span);
+            }
+            let expr = fn_sig.no_panic.as_ref().map(|e| self.desugar_expr(e));
+            (generics, decl, expr)
         } else {
-            self.as_lift_cx().lift_generics()?
+            (self.lift_generics(), self.lift_fn_decl(), None)
+        };
+        if config::dump_fhir() {
+            dbg::dump_item_info(self.genv.tcx(), self.owner.local_id(), "fhir", decl).unwrap();
         }
-        .with_refined_by(self.genv.map().refined_by(self.owner.def_id)))
+        Ok((generics, fhir::FnSig { header, decl: self.genv.alloc(decl), no_panic_if: expr }))
     }
 
-    pub(crate) fn desugar_type_alias(
+    fn desugar_fn_sig_refine_params(
         &mut self,
-        ty_alias: &surface::TyAlias,
-    ) -> Result<fhir::TyAlias> {
-        let mut env = self.gather_params_type_alias(ty_alias)?;
+        fn_sig: &surface::FnSig,
+    ) -> &'genv [fhir::RefineParam<'genv>] {
+        let genv = self.genv;
+        let mut params = self
+            .desugar_refine_params_iter(&fn_sig.params)
+            .collect_vec();
+        params.extend(self.implicit_params_to_params(fn_sig.node_id));
 
-        let mut generics = self.desugar_generics(&ty_alias.generics, &mut env)?;
-
-        let ty = self.desugar_ty(None, &ty_alias.ty, &mut env)?;
-
-        generics.refinement_params = env.into_root().into_params(self);
-        let idx = generics.refinement_params.len() - ty_alias.refined_by.index_params.len();
-        let index_params = generics.refinement_params.split_off(idx);
-
-        Ok(fhir::TyAlias {
-            owner_id: self.owner,
-            generics,
-            index_params,
-            ty,
-            span: ty_alias.span,
-            lifted: false,
-        })
+        genv.alloc_slice(&params)
     }
 
-    pub(crate) fn desugar_fn_sig(&mut self, fn_sig: &surface::FnSig) -> Result<fhir::FnSig> {
-        let mut env = self.gather_params_fn_sig(fn_sig)?;
-
-        let mut requires = vec![];
-
-        // Desugar generics after we have gathered the input params
-        let mut generics = self.desugar_generics(&fn_sig.generics, &mut env)?;
-
-        if let Some(e) = &fn_sig.requires {
-            let pred = self.desugar_expr(&mut env, e)?;
-            requires.push(fhir::Constraint::Pred(pred));
-        }
-
-        // Bail out if there's an error in the arguments to avoid confusing error messages
-        let args = fn_sig
-            .args
-            .iter()
-            .map(|arg| self.desugar_fun_arg(arg, &mut env, &mut requires))
-            .try_collect_exhaust()?;
-
-        // Desugar output
-        env.enter(ScopeId::FnOutput(fn_sig.node_id));
-        let ret = self.desugar_asyncness(fn_sig.asyncness, &fn_sig.returns, &mut env);
-
-        let ensures = fn_sig
-            .ensures
-            .iter()
-            .map(|cstr| self.desugar_constraint(cstr, &mut env))
-            .try_collect_exhaust()?;
-
-        let output = fhir::FnOutput { params: env.pop().into_params(self), ret: ret?, ensures };
-
-        generics.refinement_params = env.into_root().into_params(self);
-
-        let fn_sig =
-            fhir::FnSig { generics, requires, args, output, span: fn_sig.span, lifted: false };
-        Ok(fn_sig)
-    }
-
-    fn desugar_constraint(
+    fn desugar_fn_output(
         &mut self,
-        cstr: &surface::Constraint,
-        env: &mut Env,
-    ) -> Result<fhir::Constraint> {
+        asyncness: surface::Async,
+        output: &surface::FnOutput,
+    ) -> Result<fhir::FnOutput<'genv>> {
+        let ret = self.desugar_asyncness(asyncness, &output.returns);
+
+        let ensures = try_alloc_slice!(self.genv, &output.ensures, |it| self.desugar_ensures(it))?;
+
+        let params = self
+            .genv
+            .alloc_slice_fill_iter(self.implicit_params_to_params(output.node_id));
+        Ok(fhir::FnOutput { params, ret, ensures })
+    }
+
+    fn desugar_ensures(&mut self, cstr: &surface::Ensures) -> Result<fhir::Ensures<'genv>> {
         match cstr {
-            surface::Constraint::Type(bind, ty) => {
-                let (idx, loc) = self.resolve_loc(env, *bind)?;
-                let ty = self.desugar_ty(None, ty, env)?;
-                Ok(fhir::Constraint::Type(loc, ty, idx))
+            surface::Ensures::Type(loc, ty, node_id) => {
+                let res = self.desugar_loc(*loc, *node_id)?;
+                let path = fhir::PathExpr {
+                    segments: self.genv().alloc_slice(&[*loc]),
+                    res,
+                    fhir_id: self.next_fhir_id(),
+                    span: loc.span,
+                };
+                let ty = self.desugar_ty(ty);
+                Ok(fhir::Ensures::Type(path, self.genv().alloc(ty)))
             }
-            surface::Constraint::Pred(e) => {
-                let pred = self.desugar_expr(env, e)?;
-                Ok(fhir::Constraint::Pred(pred))
+            surface::Ensures::Pred(e) => {
+                let pred = self.desugar_expr(e);
+                Ok(fhir::Ensures::Pred(pred))
             }
         }
     }
 
-    fn desugar_fun_arg(
-        &mut self,
-        arg: &surface::Arg,
-        env: &mut Env,
-        requires: &mut Vec<fhir::Constraint>,
-    ) -> Result<fhir::Ty> {
-        match arg {
-            surface::Arg::Constr(bind, path, pred) => {
-                let bty = self.desugar_path_to_bty(path, env)?;
+    fn desugar_fn_input(&mut self, input: &surface::FnInput) -> fhir::Ty<'genv> {
+        match input {
+            surface::FnInput::Constr(bind, path, pred, node_id) => {
+                let bty = self.desugar_path_to_bty(None, path);
 
-                let pred = self.desugar_expr(env, pred)?;
-                let span = pred.span;
-                let pred = fhir::Pred {
-                    kind: fhir::PredKind::Expr(pred),
-                    span,
-                    fhir_id: self.next_fhir_id(),
-                };
+                let pred = self.desugar_expr(pred);
 
-                let ty = if let Some(idx) = self.bind_into_refine_arg(*bind, env)? {
+                let ty = if let Some(idx) = self.implicit_param_into_refine_arg(*bind, *node_id) {
                     fhir::Ty { kind: fhir::TyKind::Indexed(bty, idx), span: path.span }
                 } else {
                     fhir::Ty { kind: fhir::TyKind::BaseTy(bty), span: path.span }
                 };
 
                 let span = path.span.to(pred.span);
-                let kind = fhir::TyKind::Constr(pred, Box::new(ty));
-                Ok(fhir::Ty { kind, span })
+                let kind = fhir::TyKind::Constr(pred, self.genv.alloc(ty));
+                fhir::Ty { kind, span }
             }
-            surface::Arg::StrgRef(loc, ty) => {
+            surface::FnInput::StrgRef(loc, ty, node_id) => {
                 let span = loc.span;
-                let (idx, loc) = self.resolve_loc(env, *loc)?;
-                let ty = self.desugar_ty(None, ty, env)?;
-                requires.push(fhir::Constraint::Type(loc, ty, idx));
-                let kind = fhir::TyKind::Ptr(self.mk_lft_hole(), loc);
-                Ok(fhir::Ty { kind, span })
+                let (id, kind) = self.resolve_implicit_param(*node_id).unwrap();
+                let path = fhir::PathExpr {
+                    segments: self.genv.alloc_slice(&[*loc]),
+                    res: Res::Param(kind, id),
+                    fhir_id: self.next_fhir_id(),
+                    span: loc.span,
+                };
+                let ty = self.desugar_ty(ty);
+                let kind = fhir::TyKind::StrgRef(self.genv.alloc(path), self.genv.alloc(ty));
+                fhir::Ty { kind, span }
             }
-            surface::Arg::Ty(bind, ty) => self.desugar_ty(*bind, ty, env),
+            surface::FnInput::Ty(bind, ty, node_id) => {
+                if let Some(bind) = bind
+                    && let surface::TyKind::Base(bty) = &ty.kind
+                {
+                    let bty = self.desugar_bty(bty);
+                    let kind =
+                        if let Some(idx) = self.implicit_param_into_refine_arg(*bind, *node_id) {
+                            fhir::TyKind::Indexed(bty, idx)
+                        } else {
+                            fhir::TyKind::BaseTy(bty)
+                        };
+                    fhir::Ty { kind, span: ty.span }
+                } else {
+                    self.desugar_ty(ty)
+                }
+            }
         }
     }
 
@@ -678,679 +662,1267 @@ impl<'a, 'tcx> RustItemCtxt<'a, 'tcx> {
         &mut self,
         asyncness: surface::Async,
         returns: &surface::FnRetTy,
-        env: &mut Env,
-    ) -> Result<fhir::Ty> {
+    ) -> fhir::Ty<'genv> {
         match asyncness {
-            surface::Async::Yes { node_id, span } => {
-                let item_id = self.resolver_output.impl_trait_res_map[&node_id];
-                let def_id = item_id.owner_id.def_id;
-                let res = Res::Def(DefKind::OpaqueTy, def_id.to_def_id());
+            surface::Async::Yes { span, .. } => {
+                // If there's more than one opaque it will fail when collecting it so we can unwrap here
+                let def_id = self.opaque.unwrap();
 
-                let opaque_ty = self
-                    .with_new_owner(item_id.owner_id)
-                    .desugar_opaque_ty_for_async(returns, env)?;
-                self.insert_opaque_ty(item_id.owner_id.def_id, opaque_ty);
-
-                let (args, _) = self.desugar_generic_args(res, &[], env)?;
-                let item_id = hir::ItemId { owner_id: hir::OwnerId { def_id } };
-                let refine_args = env.root().to_refine_args(self, span);
-                let kind = fhir::TyKind::OpaqueDef(item_id, args, refine_args, false);
-                Ok(fhir::Ty { kind, span })
+                // FIXME(nilehmann) since we can only pass local ids for opaque types it means we
+                // can't support extern specs with opaque types.
+                let opaque_ty = self.desugar_opaque_ty_for_async(def_id, returns);
+                let opaque_ty = self.insert_opaque_ty(opaque_ty);
+                let kind = fhir::TyKind::OpaqueDef(opaque_ty);
+                fhir::Ty { kind, span }
             }
-            surface::Async::No => Ok(self.desugar_fn_ret_ty(returns, env)?),
+            surface::Async::No => self.desugar_fn_ret_ty(returns),
         }
     }
 
     fn desugar_opaque_ty_for_async(
         &mut self,
+        def_id: LocalDefId,
         returns: &surface::FnRetTy,
-        env: &mut Env,
-    ) -> Result<fhir::OpaqueTy> {
-        let output = self.desugar_fn_ret_ty(returns, env)?;
-        // Does this opaque type has any generics?
-        let generics = self.as_lift_cx().lift_generics()?;
-        let bound = fhir::GenericBound::LangItemTrait(
-            hir::LangItem::Future,
-            vec![],
-            vec![fhir::TypeBinding {
+    ) -> fhir::OpaqueTy<'genv> {
+        let output = self.desugar_fn_ret_ty(returns);
+        let trait_ref = self.make_lang_item_path(
+            rustc_attr_ir::LangItem::Future,
+            DUMMY_SP,
+            &[],
+            self.genv.alloc_slice(&[fhir::AssocItemConstraint {
                 ident: surface::Ident::with_dummy_span(sym::Output),
-                term: output,
-            }],
+                kind: fhir::AssocItemConstraintKind::Equality { term: output },
+            }]),
         );
-        Ok(fhir::OpaqueTy { generics, bounds: vec![bound] })
-    }
-
-    fn desugar_fn_ret_ty(&mut self, returns: &surface::FnRetTy, env: &mut Env) -> Result<fhir::Ty> {
-        match returns {
-            surface::FnRetTy::Ty(ty) => self.desugar_ty(None, ty, env),
-            surface::FnRetTy::Default(span) => {
-                let kind = fhir::TyKind::Tuple(vec![]);
-                Ok(fhir::Ty { kind, span: *span })
-            }
+        let bound = fhir::GenericBound::Trait(fhir::PolyTraitRef {
+            bound_generic_params: &[],
+            refine_params: &[],
+            modifiers: fhir::TraitBoundModifier::None,
+            trait_ref,
+            span: trait_ref.span,
+        });
+        fhir::OpaqueTy {
+            def_id: MaybeExternId::Local(def_id),
+            bounds: self.genv.alloc_slice(&[bound]),
         }
     }
 
-    fn desugar_ty(
+    fn make_lang_item_path(
         &mut self,
-        bind: Option<surface::Ident>,
-        ty: &surface::Ty,
-        env: &mut Env,
-    ) -> Result<fhir::Ty> {
-        let node_id = ty.node_id;
-        let span = ty.span;
-        let kind = match &ty.kind {
-            surface::TyKind::Base(bty) => {
-                // CODESYNC(type-holes, 3)
-                if let surface::BaseTyKind::Path(path) = &bty.kind
-                    && path.is_hole()
-                {
-                    fhir::TyKind::Hole(self.next_fhir_id())
-                } else {
-                    return self.desugar_bty_bind(bind, bty, env);
-                }
-            }
-            surface::TyKind::Indexed { bty, indices } => {
-                let bty = self.desugar_bty(bty, env)?;
-                let idx = self.desugar_indices(indices, env)?;
-                fhir::TyKind::Indexed(bty, idx)
-            }
-            surface::TyKind::Exists { bind: ex_bind, bty, pred } => {
-                let ty_span = ty.span;
-                let bty_span = bty.span;
+        lang_item: rustc_attr_ir::LangItem,
+        span: Span,
+        args: &'genv [fhir::GenericArg<'genv>],
+        constraints: &'genv [fhir::AssocItemConstraint<'genv>],
+    ) -> fhir::Path<'genv> {
+        let def_id = self.genv.tcx().require_lang_item(lang_item, span);
+        let def_kind = self.genv.def_kind(def_id);
+        let res = Res::Def(def_kind, def_id);
+        fhir::Path {
+            span,
+            fhir_id: self.next_fhir_id(),
+            res,
+            segments: self.genv.alloc_slice_fill_iter([fhir::PathSegment {
+                ident: surface::Ident::new(lang_item.name(), span),
+                res,
+                args,
+                constraints,
+            }]),
+            refine: &[],
+        }
+    }
 
-                env.enter(ScopeId::Exists(node_id));
-
-                let bty = self.desugar_bty(bty, env)?;
-                let pred = self.desugar_pred(env, pred)?;
-
-                let params = env.pop().into_params(self);
-
-                let idx = fhir::RefineArg {
-                    kind: fhir::RefineArgKind::Expr(fhir::Expr {
-                        kind: fhir::ExprKind::Var(params[0].ident, None),
-                        span: ex_bind.span,
-                        fhir_id: self.next_fhir_id(),
-                    }),
-                    span: ex_bind.span,
-                    fhir_id: self.next_fhir_id(),
-                };
-                let indexed = fhir::Ty { kind: fhir::TyKind::Indexed(bty, idx), span: bty_span };
-                let constr =
-                    fhir::Ty { kind: fhir::TyKind::Constr(pred, Box::new(indexed)), span: ty_span };
-                fhir::TyKind::Exists(params, Box::new(constr))
+    fn desugar_fn_ret_ty(&mut self, returns: &surface::FnRetTy) -> fhir::Ty<'genv> {
+        match returns {
+            surface::FnRetTy::Ty(ty) => self.desugar_ty(ty),
+            surface::FnRetTy::Default(span) => {
+                let kind = fhir::TyKind::Tuple(&[]);
+                fhir::Ty { kind, span: *span }
             }
-            surface::TyKind::GeneralExists { ty, pred, .. } => {
-                env.enter(ScopeId::Exists(node_id));
-                let mut ty = self.desugar_ty(None, ty, env)?;
-                if let Some(pred) = pred {
-                    let pred = self.desugar_expr(env, pred)?;
-                    let span = ty.span.to(pred.span);
-                    let pred = fhir::Pred {
-                        kind: fhir::PredKind::Expr(pred),
-                        span,
-                        fhir_id: self.next_fhir_id(),
-                    };
-                    ty = fhir::Ty { kind: fhir::TyKind::Constr(pred, Box::new(ty)), span };
-                }
-                let params = env.pop().into_params(self);
-
-                fhir::TyKind::Exists(params, Box::new(ty))
-            }
-            surface::TyKind::Constr(pred, ty) => {
-                let pred = self.desugar_pred(env, pred)?;
-                let ty = self.desugar_ty(None, ty, env)?;
-                fhir::TyKind::Constr(pred, Box::new(ty))
-            }
-            surface::TyKind::Ref(mutbl, ty) => {
-                let mut_ty =
-                    fhir::MutTy { ty: Box::new(self.desugar_ty(None, ty, env)?), mutbl: *mutbl };
-                fhir::TyKind::Ref(self.mk_lft_hole(), mut_ty)
-            }
-            surface::TyKind::Tuple(tys) => {
-                let tys = tys
-                    .iter()
-                    .map(|ty| self.desugar_ty(None, ty, env))
-                    .try_collect_exhaust()?;
-                fhir::TyKind::Tuple(tys)
-            }
-            surface::TyKind::Array(ty, len) => {
-                let ty = self.desugar_ty(None, ty, env)?;
-                fhir::TyKind::Array(Box::new(ty), fhir::ArrayLen { val: len.val, span: len.span })
-            }
-            surface::TyKind::ImplTrait(node_id, bounds) => {
-                let item_id = self.resolver_output.impl_trait_res_map[&node_id];
-                let def_id = item_id.owner_id.def_id;
-                let res = Res::Def(DefKind::OpaqueTy, def_id.to_def_id());
-
-                let opaque_ty = self
-                    .with_new_owner(item_id.owner_id)
-                    .desugar_opaque_ty_for_impl_trait(bounds, env)?;
-                self.insert_opaque_ty(def_id, opaque_ty);
-
-                let (args, _) = self.desugar_generic_args(res, &[], env)?;
-                let refine_args = env.root().to_refine_args(self, ty.span);
-                fhir::TyKind::OpaqueDef(item_id, args, refine_args, false)
-            }
-        };
-        Ok(fhir::Ty { kind, span })
+        }
     }
 
     fn desugar_opaque_ty_for_impl_trait(
         &mut self,
-        bounds: &surface::GenericBounds,
-        env: &mut Env,
-    ) -> Result<fhir::OpaqueTy> {
-        let generics = self.as_lift_cx().lift_generics()?;
-        let bounds = self.desugar_generic_bounds(bounds, env)?;
-        Ok(fhir::OpaqueTy { generics, bounds })
-    }
-
-    fn mk_lft_hole(&self) -> fhir::Lifetime {
-        fhir::Lifetime::Hole(self.next_fhir_id())
-    }
-
-    fn desugar_indices(
-        &mut self,
-        idxs: &surface::Indices,
-        env: &mut Env,
-    ) -> Result<fhir::RefineArg> {
-        if let [arg] = &idxs.indices[..] {
-            self.desugar_refine_arg(arg, env)
-        } else {
-            let flds = idxs
-                .indices
-                .iter()
-                .map(|arg| self.desugar_refine_arg(arg, env))
-                .try_collect_exhaust()?;
-            Ok(fhir::RefineArg {
-                kind: fhir::RefineArgKind::Record(flds),
-                fhir_id: self.next_fhir_id(),
-                span: idxs.span,
-            })
-        }
-    }
-
-    fn desugar_refine_arg(
-        &mut self,
-        arg: &surface::RefineArg,
-        env: &mut Env,
-    ) -> Result<fhir::RefineArg> {
-        match arg {
-            surface::RefineArg::Bind(ident, ..) => {
-                Ok(self.bind_into_refine_arg(*ident, env)?.unwrap())
-            }
-            surface::RefineArg::Expr(expr) => {
-                Ok(fhir::RefineArg {
-                    kind: fhir::RefineArgKind::Expr(self.desugar_expr(env, expr)?),
-                    fhir_id: self.next_fhir_id(),
-                    span: expr.span,
-                })
-            }
-            surface::RefineArg::Abs(_, body, node_id, span) => {
-                env.enter(ScopeId::Abs(*node_id));
-                let body = self.desugar_expr(env, body)?;
-                let params = env.pop().into_params(self);
-                Ok(fhir::RefineArg {
-                    kind: fhir::RefineArgKind::Abs(params, body),
-                    fhir_id: self.next_fhir_id(),
-                    span: *span,
-                })
-            }
-        }
-    }
-
-    fn bind_into_refine_arg(
-        &self,
-        ident: surface::Ident,
-        env: &Env,
-    ) -> Result<Option<fhir::RefineArg>> {
-        match env.get(ident) {
-            Some(param) => {
-                Ok(Some(fhir::RefineArg {
-                    kind: fhir::RefineArgKind::Expr(fhir::Expr {
-                        kind: fhir::ExprKind::Var(
-                            fhir::Ident::new(param.name, ident),
-                            Some(param.kind),
-                        ),
-                        span: ident.span,
-                        fhir_id: self.next_fhir_id(),
-                    }),
-                    fhir_id: self.next_fhir_id(),
-                    span: ident.span,
-                }))
-            }
-            None => Ok(None),
-        }
-    }
-
-    fn desugar_bty(&mut self, bty: &surface::BaseTy, env: &mut Env) -> Result<fhir::BaseTy> {
-        match &bty.kind {
-            surface::BaseTyKind::Path(path) => self.desugar_path_to_bty(path, env),
-            surface::BaseTyKind::Slice(ty) => {
-                let kind = fhir::BaseTyKind::Slice(Box::new(self.desugar_ty(None, ty, env)?));
-                Ok(fhir::BaseTy { kind, span: bty.span })
-            }
-        }
-    }
-
-    fn desugar_path(&mut self, path: &surface::Path, env: &mut Env) -> Result<fhir::Path> {
-        let res = self.resolver_output.path_res_map[&path.node_id];
-        let (args, bindings) = self.desugar_generic_args(res, &path.generics, env)?;
-        let refine = path
-            .refine
-            .iter()
-            .map(|arg| self.desugar_refine_arg(arg, env))
-            .try_collect_exhaust()?;
-        Ok(fhir::Path { res, args, bindings, refine, span: path.span })
-    }
-
-    fn desugar_path_to_bty(&mut self, path: &surface::Path, env: &mut Env) -> Result<fhir::BaseTy> {
-        Ok(fhir::BaseTy::from(fhir::QPath::Resolved(None, self.desugar_path(path, env)?)))
-    }
-
-    fn desugar_alias_pred(
-        &mut self,
-        env: &mut Env,
-        alias_pred: &surface::AliasPred,
-        refine_args: &[surface::RefineArg],
-    ) -> Result<fhir::PredKind> {
-        let path = self.desugar_path(&alias_pred.trait_id, env)?;
-        if let Res::Def(DefKind::Trait, trait_id) = path.res {
-            let (generic_args, _) =
-                self.desugar_generic_args(path.res, &alias_pred.generic_args, env)?;
-            let refine_args = refine_args
-                .iter()
-                .map(|arg| self.desugar_refine_arg(arg, env))
-                .try_collect_exhaust()?;
-            let alias_pred = fhir::AliasPred { trait_id, name: alias_pred.name.name, generic_args };
-            Ok(fhir::PredKind::Alias(alias_pred, refine_args))
-        } else {
-            Err(self.emit_err(errors::UnresolvedVar::from_path(&alias_pred.trait_id, "trait")))
-        }
-    }
-
-    fn desugar_pred(&mut self, env: &mut Env, pred: &surface::Pred) -> Result<fhir::Pred> {
-        let kind = match &pred.kind {
-            surface::PredKind::Expr(expr) => fhir::PredKind::Expr(self.desugar_expr(env, expr)?),
-            surface::PredKind::Alias(alias_pred, args) => {
-                self.desugar_alias_pred(env, alias_pred, args)?
-            }
-        };
-        let span = pred.span;
-        Ok(fhir::Pred { kind, span, fhir_id: self.next_fhir_id() })
-    }
-    fn desugar_generic_args(
-        &mut self,
-        res: Res,
-        args: &[surface::GenericArg],
-        env: &mut Env,
-    ) -> Result<(Vec<fhir::GenericArg>, Vec<fhir::TypeBinding>)> {
-        let mut fhir_args = vec![];
-        let mut bindings = vec![];
-        if let Res::Def(
-            DefKind::TyAlias { .. } | DefKind::Struct | DefKind::Enum | DefKind::OpaqueTy,
-            def_id,
-        ) = res
-        {
-            let generics = self.genv.tcx.generics_of(def_id);
-            for param in &generics.params {
-                if let rustc_middle::ty::GenericParamDefKind::Lifetime = param.kind {
-                    fhir_args.push(fhir::GenericArg::Lifetime(self.mk_lft_hole()));
-                }
-            }
-        }
-        for arg in args {
-            match arg {
-                surface::GenericArg::Type(ty) => {
-                    fhir_args.push(fhir::GenericArg::Type(self.desugar_ty(None, ty, env)?));
-                }
-                surface::GenericArg::Constraint(ident, ty) => {
-                    bindings.push(fhir::TypeBinding {
-                        ident: *ident,
-                        term: self.desugar_ty(None, ty, env)?,
-                    });
-                }
-            }
-        }
-        Ok((fhir_args, bindings))
-    }
-
-    fn desugar_bty_bind(
-        &mut self,
-        bind: Option<surface::Ident>,
-        bty: &surface::BaseTy,
-        env: &mut Env,
-    ) -> Result<fhir::Ty> {
-        let bty = self.desugar_bty(bty, env)?;
-
-        let span = bty.span;
-        let kind = if let Some(bind) = bind
-            && let Some(idx) = self.bind_into_refine_arg(bind, env)?
-        {
-            fhir::TyKind::Indexed(bty, idx)
-        } else {
-            fhir::TyKind::BaseTy(bty)
-        };
-        Ok(fhir::Ty { kind, span })
+        def_id: LocalDefId,
+        bounds: &[surface::TraitRef],
+    ) -> fhir::OpaqueTy<'genv> {
+        let bounds = self.desugar_generic_bounds(bounds);
+        fhir::OpaqueTy { def_id: MaybeExternId::Local(def_id), bounds }
     }
 
     fn desugar_variant_ret(
         &mut self,
         ret: &surface::VariantRet,
-        env: &mut Env,
-    ) -> Result<fhir::VariantRet> {
-        let bty = self.desugar_path_to_bty(&ret.path, env)?;
-        let idx = self.desugar_indices(&ret.indices, env)?;
-        Ok(fhir::VariantRet { bty, idx })
+    ) -> Result<fhir::VariantRet<'genv>> {
+        let Some(enum_id) = self.check_variant_ret_path(&ret.path) else {
+            return Err(self.emit(errors::InvalidVariantRet::new(&ret.path)));
+        };
+        let idx = self.desugar_indices(&ret.indices);
+        Ok(fhir::VariantRet { enum_id, idx })
     }
 
-    fn insert_opaque_ty(&mut self, def_id: LocalDefId, opaque_ty: fhir::OpaqueTy) {
+    fn check_variant_ret_path(&mut self, path: &surface::Path) -> Option<DefId> {
+        let resolved_id = self.owner.resolved_id();
+
+        match self.resolver_output().path_res_map[&path.node_id].full_res()? {
+            fhir::Res::Def(DefKind::Enum, def_id) if def_id == resolved_id => {}
+            fhir::Res::SelfTyAlias { .. } => return Some(resolved_id),
+            _ => return None,
+        }
+
+        let generics = self.genv.tcx().generics_of(resolved_id);
+        let args = &path.last().args;
+        if generics.own_counts().types != args.len() {
+            return None;
+        }
+        let mut i = 0;
+        for param in &generics.own_params {
+            let rustc_middle::ty::GenericParamDefKind::Type { .. } = param.kind else { continue };
+            let arg = &args[i];
+            if let surface::GenericArgKind::Type(arg_ty) = &arg.kind
+                && let surface::TyKind::Base(arg_bty) = &arg_ty.kind
+                && let surface::BaseTyKind::Path(None, arg_path) = &arg_bty.kind
+                && let fhir::Res::Def(DefKind::TyParam, def_id) =
+                    self.resolver_output().path_res_map[&arg_path.node_id].full_res()?
+                && def_id == param.def_id
+            {
+            } else {
+                return None;
+            }
+            i += 1;
+        }
+
+        Some(resolved_id)
+    }
+
+    fn insert_opaque_ty(
+        &mut self,
+        opaque_ty: fhir::OpaqueTy<'genv>,
+    ) -> &'genv fhir::OpaqueTy<'genv> {
+        let opaque_ty = self.genv.alloc(opaque_ty);
         self.opaque_tys
             .as_mut()
-            .unwrap_or_else(|| bug!("`impl Trait` not supported in this item {def_id:?}"))
-            .insert(def_id, opaque_ty);
+            .unwrap_or_else(|| bug!("`impl Trait` not supported in this item `{:?}`", self.owner))
+            .push(opaque_ty);
+        opaque_ty
+    }
+}
+
+impl ErrorEmitter for RustItemCtxt<'_, '_, '_> {
+    fn emit<'a>(&'a self, err: impl Diagnostic<'a>) -> ErrorGuaranteed {
+        self.errors.emit(err)
+    }
+}
+
+impl ErrorCollector<ErrorGuaranteed> for RustItemCtxt<'_, '_, '_> {
+    type Result = std::result::Result<(), ErrorGuaranteed>;
+
+    fn collect(&mut self, err: ErrorGuaranteed) {
+        self.errors.collect(err);
     }
 
-    fn sess(&self) -> &'a FluxSession {
-        self.genv.sess
+    fn into_result(self) -> Self::Result {
+        self.errors.into_result()
+    }
+}
+
+pub(crate) struct FluxItemCtxt<'genv, 'tcx> {
+    genv: GlobalEnv<'genv, 'tcx>,
+    resolver_output: &'genv ResolverOutput,
+    local_id_gen: IndexGen<fhir::ItemLocalId>,
+    owner: FluxLocalDefId,
+    allow_primop_app: bool,
+    errors: Errors<'genv>,
+}
+
+impl<'genv, 'tcx> FluxItemCtxt<'genv, 'tcx> {
+    pub(crate) fn with<T>(
+        genv: GlobalEnv<'genv, 'tcx>,
+        resolver_output: &'genv ResolverOutput,
+        owner: FluxLocalDefId,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> Result<T> {
+        let mut cx = Self {
+            genv,
+            resolver_output,
+            local_id_gen: Default::default(),
+            owner,
+            allow_primop_app: false,
+            errors: Errors::new(genv.sess()),
+        };
+        let r = f(&mut cx);
+        cx.into_result()?;
+        Ok(r)
+    }
+
+    pub(crate) fn desugar_flux_item(&mut self, item: &surface::FluxItem) -> fhir::FluxItem<'genv> {
+        match item {
+            surface::FluxItem::Qualifier(qual) => {
+                let qual = self.desugar_qualifier(qual);
+                fhir::FluxItem::Qualifier(self.genv.alloc(qual))
+            }
+            surface::FluxItem::FuncDef(func) => {
+                let func = self.desugar_spec_func(func);
+                fhir::FluxItem::Func(self.genv.alloc(func))
+            }
+            surface::FluxItem::PrimOpProp(primop_prop) => {
+                self.allow_primop_app = true;
+                let primop_prop = self.desugar_primop_prop(primop_prop);
+                self.allow_primop_app = false;
+                fhir::FluxItem::PrimOpProp(self.genv.alloc(primop_prop))
+            }
+            surface::FluxItem::Axiom(axiom) => {
+                // Axioms can talk about the UIFs for primops, e.g., `[&](x, y)`
+                self.allow_primop_app = true;
+                let axiom = self.desugar_axiom(axiom);
+                self.allow_primop_app = false;
+                fhir::FluxItem::Axiom(self.genv.alloc(axiom))
+            }
+            surface::FluxItem::SortDecl(sort_decl) => {
+                let sort_decl = self.desugar_sort_decl(sort_decl);
+                fhir::FluxItem::SortDecl(self.genv.alloc(sort_decl))
+            }
+            surface::FluxItem::Use(..) => bug!("unexpected use item"),
+        }
+    }
+
+    pub(crate) fn desugar_sort_decl(&mut self, sort_decl: &surface::SortDecl) -> fhir::SortDecl {
+        fhir::SortDecl {
+            def_id: self.owner,
+            params: sort_decl.sort_vars.len(),
+            span: sort_decl.name.span,
+        }
+    }
+
+    fn desugar_qualifier_kind(qualifier: &surface::Qualifier) -> QualifierKind {
+        match qualifier.kind {
+            surface::QualifierKind::Global => QualifierKind::Global,
+            surface::QualifierKind::Local => QualifierKind::Local,
+            surface::QualifierKind::Hint => QualifierKind::Hint,
+        }
+    }
+
+    fn desugar_qualifier(&mut self, qualifier: &surface::Qualifier) -> fhir::Qualifier<'genv> {
+        let kind = Self::desugar_qualifier_kind(qualifier);
+        fhir::Qualifier {
+            def_id: self.owner,
+            args: self.desugar_refine_params(&qualifier.params),
+            wildcards: self.genv().alloc_slice(&qualifier.wildcards),
+            kind,
+            expr: self.desugar_expr(&qualifier.expr),
+        }
+    }
+
+    fn desugar_primop_prop(
+        &mut self,
+        primop_prop: &surface::PrimOpProp,
+    ) -> fhir::PrimOpProp<'genv> {
+        let body = self.desugar_expr(&primop_prop.body);
+        let args = self.desugar_refine_params(&primop_prop.params);
+        fhir::PrimOpProp {
+            def_id: self.owner,
+            op: primop_prop.op,
+            args,
+            body,
+            span: primop_prop.span,
+        }
+    }
+
+    fn desugar_axiom(&mut self, axiom: &surface::Axiom) -> fhir::Axiom<'genv> {
+        fhir::Axiom {
+            def_id: self.owner,
+            args: self.desugar_refine_params(&axiom.params),
+            body: self.desugar_expr(&axiom.body),
+            span: axiom.span,
+        }
+    }
+
+    fn desugar_spec_func(&mut self, spec_func: &surface::SpecFunc) -> fhir::SpecFunc<'genv> {
+        let body = spec_func.body.as_ref().map(|body| self.desugar_expr(body));
+        let params = spec_func.sort_vars.len();
+        let sort = self.desugar_sort(&spec_func.output, None);
+        let args = self.desugar_refine_params(&spec_func.params);
+        let ident_span = spec_func.name.span;
+        fhir::SpecFunc {
+            def_id: self.owner,
+            params,
+            args,
+            sort,
+            body,
+            hide: spec_func.hide,
+            ident_span,
+        }
+    }
+}
+
+impl ErrorEmitter for FluxItemCtxt<'_, '_> {
+    fn emit<'a>(&'a self, err: impl Diagnostic<'a>) -> ErrorGuaranteed {
+        self.errors.emit(err)
+    }
+}
+
+impl ErrorCollector<ErrorGuaranteed> for FluxItemCtxt<'_, '_> {
+    type Result = std::result::Result<(), ErrorGuaranteed>;
+
+    fn collect(&mut self, err: ErrorGuaranteed) {
+        self.errors.collect(err);
+    }
+
+    fn into_result(self) -> Self::Result {
+        self.errors.into_result()
+    }
+}
+
+trait DesugarCtxt<'genv, 'tcx: 'genv>: ErrorEmitter + ErrorCollector<ErrorGuaranteed> {
+    fn genv(&self) -> GlobalEnv<'genv, 'tcx>;
+    fn resolver_output(&self) -> &'genv ResolverOutput;
+    fn next_fhir_id(&self) -> FhirId;
+    fn desugar_impl_trait(&mut self, bounds: &[surface::TraitRef]) -> fhir::TyKind<'genv>;
+
+    fn allow_primop_app(&self) -> bool {
+        false
+    }
+
+    fn resolve_implicit_param(&self, node_id: NodeId) -> Option<(fhir::ParamId, fhir::ParamKind)> {
+        self.resolver_output().param_res_map.get(&node_id).copied()
+    }
+
+    /// Holes are filled in by zipping the annotation against the corresponding rust type, so
+    /// they cannot appear in a qualified path `<qself as path>`, which has no rust counterpart.
+    fn check_no_holes(&self, qself: &surface::Ty, path: &surface::Path) -> Result {
+        collect_holes(qself, path)
+            .into_iter()
+            .try_for_each_exhaust(|span| Err(self.emit(errors::UnsupportedHole::new(span))))
+    }
+
+    fn desugar_epath(&self, path: &surface::ExprPath) -> fhir::QPathExpr<'genv> {
+        let partial_res = self
+            .opt_resolve_path(path.node_id)
+            .unwrap_or_else(|| span_bug!(path.span, "unresolved expr path"));
+
+        let unresolved_segments = partial_res.unresolved_segments();
+
+        if unresolved_segments == 0 {
+            let path = fhir::PathExpr {
+                segments: self
+                    .genv()
+                    .alloc_slice_fill_iter(path.segments.iter().map(|s| s.ident)),
+                res: partial_res.base_res(),
+                fhir_id: self.next_fhir_id(),
+                span: path.span,
+            };
+            return fhir::QPathExpr::Resolved(path, None);
+        }
+
+        let proj_start = path.segments.len() - unresolved_segments;
+        let ty_path = fhir::Path {
+            res: partial_res.base_res(),
+            fhir_id: self.next_fhir_id(),
+            segments: self.genv().alloc_slice_fill_iter(
+                path.segments[..proj_start]
+                    .iter()
+                    .map(|segment| self.desugar_epath_segment(segment)),
+            ),
+            refine: &[],
+            span: path.span,
+        };
+
+        let mut ty = self
+            .genv()
+            .alloc(self.ty_path(fhir::QPath::Resolved(None, ty_path)));
+
+        for (i, segment) in path.segments.iter().enumerate().skip(proj_start) {
+            if i == path.segments.len() - 1 {
+                return fhir::QPathExpr::TypeRelative(ty, segment.ident);
+            }
+
+            let hir_segment = self.desugar_epath_segment(segment);
+            let qpath = fhir::QPath::TypeRelative(ty, self.genv().alloc(hir_segment));
+            ty = self.genv().alloc(self.ty_path(qpath));
+        }
+
+        span_bug!(
+            path.span,
+            "desugar_epath: no final extension segment in {}..{}",
+            proj_start,
+            path.segments.len()
+        );
     }
 
     #[track_caller]
-    fn emit_err<'b>(&'b self, err: impl IntoDiagnostic<'b>) -> ErrorGuaranteed {
-        self.sess().emit_err(err)
-    }
-}
-
-impl<'a, 'tcx> FluxItemCtxt<'a, 'tcx> {
-    fn new(genv: &'a GlobalEnv<'a, 'tcx>, owner: Symbol) -> Self {
-        Self { genv, local_id_gen: Default::default(), owner }
-    }
-}
-
-impl Env {
-    fn from_params<'a>(
-        genv: &GlobalEnv,
-        sort_resolver: &SortResolver,
-        scope: ScopeId,
-        params: impl IntoIterator<Item = &'a surface::RefineParam>,
-    ) -> Result<Self> {
-        let mut env = Env::new(scope);
-        let name_gen = IndexGen::new();
-        for param in params {
-            let sort = sort_resolver.resolve_sort(&param.sort)?;
-            env.insert(
-                genv.sess,
-                param.name,
-                Param {
-                    name: name_gen.fresh(),
-                    sort,
-                    kind: fhir::ParamKind::Explicit,
-                    span: param.span,
-                },
-            )?;
+    fn desugar_loc(&self, ident: surface::Ident, node_id: NodeId) -> Result<Res> {
+        let partial_res = self.resolve_path(node_id);
+        if let Some(res @ Res::Param(fhir::ParamKind::Loc, _)) = partial_res.full_res() {
+            Ok(res)
+        } else {
+            let span = ident.span;
+            Err(self.emit(errors::InvalidLoc { span }))
         }
-        Ok(env)
     }
-}
 
-fn desugar_bin_op(op: surface::BinOp) -> fhir::BinOp {
-    match op {
-        surface::BinOp::Iff => fhir::BinOp::Iff,
-        surface::BinOp::Imp => fhir::BinOp::Imp,
-        surface::BinOp::Or => fhir::BinOp::Or,
-        surface::BinOp::And => fhir::BinOp::And,
-        surface::BinOp::Eq => fhir::BinOp::Eq,
-        surface::BinOp::Ne => fhir::BinOp::Ne,
-        surface::BinOp::Gt => fhir::BinOp::Gt,
-        surface::BinOp::Ge => fhir::BinOp::Ge,
-        surface::BinOp::Lt => fhir::BinOp::Lt,
-        surface::BinOp::Le => fhir::BinOp::Le,
-        surface::BinOp::Add => fhir::BinOp::Add,
-        surface::BinOp::Sub => fhir::BinOp::Sub,
-        surface::BinOp::Mod => fhir::BinOp::Mod,
-        surface::BinOp::Mul => fhir::BinOp::Mul,
-        surface::BinOp::Div => fhir::BinOp::Div,
+    fn opt_resolve_path(&self, node_id: NodeId) -> Option<PartialRes> {
+        Some(
+            self.resolver_output()
+                .path_res_map
+                .get(&node_id)?
+                .map_param_id(|param_id| self.resolve_param(param_id).0),
+        )
     }
-}
 
-fn desugar_un_op(op: surface::UnOp) -> fhir::UnOp {
-    match op {
-        surface::UnOp::Not => fhir::UnOp::Not,
-        surface::UnOp::Neg => fhir::UnOp::Neg,
+    fn resolve_path(&self, node_id: NodeId) -> PartialRes {
+        self.opt_resolve_path(node_id).unwrap()
     }
-}
 
-impl Scope<Param> {
-    fn to_refine_args<'a, 'tcx: 'a>(
+    #[track_caller]
+    fn resolve_param(&self, node_id: NodeId) -> (fhir::ParamId, fhir::ParamKind) {
+        self.resolver_output().param_res_map[&node_id]
+    }
+
+    fn resolve_implicit_params(
         &self,
-        cx: &impl DesugarCtxt<'a, 'tcx>,
-        span: Span,
-    ) -> Vec<fhir::RefineArg> {
-        let mut refine_args = vec![];
-        for (ident, param) in self.iter() {
-            let ident = fhir::Ident::new(param.name, *ident);
-            refine_args.push(fhir::RefineArg {
-                kind: fhir::RefineArgKind::Expr(fhir::Expr {
-                    kind: ExprKind::Var(ident, None),
-                    span,
-                    fhir_id: cx.next_fhir_id(),
-                }),
-                fhir_id: cx.next_fhir_id(),
-                span,
-            });
-        }
-        refine_args
+        scope: NodeId,
+    ) -> impl ExactSizeIterator<Item = (surface::Ident, fhir::ParamId, fhir::ParamKind)> {
+        self.resolver_output()
+            .implicit_params
+            .get(&scope)
+            .map_or(&[][..], |it| it)
+            .iter()
+            .map(|(ident, param_id)| {
+                let (param_id, kind) = self.resolve_param(*param_id);
+                (*ident, param_id, kind)
+            })
     }
 
-    fn into_params<'a, 'tcx: 'a>(self, cx: &impl DesugarCtxt<'a, 'tcx>) -> Vec<fhir::RefineParam> {
-        let mut params = vec![];
-        for (ident, param) in self.into_iter() {
-            let ident = fhir::Ident::new(param.name, ident);
-            let fhir_id = cx.next_fhir_id();
-            params.push(fhir::RefineParam {
-                ident,
-                sort: param.sort,
-                kind: param.kind,
-                fhir_id,
-                span: param.span,
-            });
-        }
-        params
-    }
-}
-
-trait DesugarCtxt<'a, 'tcx: 'a> {
-    fn genv(&self) -> &'a GlobalEnv<'a, 'tcx>;
-    fn next_fhir_id(&self) -> FhirId;
-
-    fn desugar_expr(&self, env: &mut Env, expr: &surface::Expr) -> Result<fhir::Expr> {
-        let kind = match &expr.kind {
-            surface::ExprKind::QPath(qpath) => {
-                match self.resolve_qpath(env, qpath)? {
-                    QPathRes::Param(ident) => fhir::ExprKind::Var(ident, None),
-                    QPathRes::Const(const_info) => {
-                        fhir::ExprKind::Const(const_info.def_id, qpath.span)
-                    }
-                    QPathRes::NumConst(i) => fhir::ExprKind::Literal(fhir::Lit::Int(i)),
+    fn implicit_params_to_params(
+        &self,
+        scope: NodeId,
+    ) -> impl ExactSizeIterator<Item = fhir::RefineParam<'genv>> {
+        self.resolve_implicit_params(scope)
+            .map(|(ident, id, kind)| {
+                let sort = if kind.is_loc() { fhir::Sort::Loc } else { fhir::Sort::Infer };
+                fhir::RefineParam {
+                    id,
+                    name: ident.name,
+                    span: ident.span,
+                    kind,
+                    sort,
+                    fhir_id: self.next_fhir_id(),
                 }
+            })
+    }
+
+    fn desugar_refine_params(
+        &mut self,
+        params: &[surface::RefineParam],
+    ) -> &'genv [fhir::RefineParam<'genv>] {
+        self.genv()
+            .alloc_slice_fill_iter(self.desugar_refine_params_iter(params))
+    }
+
+    fn desugar_refine_params_iter(
+        &mut self,
+        params: &[surface::RefineParam],
+    ) -> impl ExactSizeIterator<Item = fhir::RefineParam<'genv>> {
+        params.iter().map(|param| self.desugar_refine_param(param))
+    }
+
+    fn desugar_refine_param(&mut self, param: &surface::RefineParam) -> fhir::RefineParam<'genv> {
+        let (id, kind) = self.resolve_param(param.node_id);
+        fhir::RefineParam {
+            id,
+            name: param.ident.name,
+            span: param.ident.span,
+            kind,
+            sort: self.desugar_sort(&param.sort, None),
+            fhir_id: self.next_fhir_id(),
+        }
+    }
+
+    fn desugar_sort(
+        &mut self,
+        sort: &surface::Sort,
+        generic_id_to_var_idx: Option<&FxIndexSet<DefId>>,
+    ) -> fhir::Sort<'genv> {
+        match sort {
+            surface::Sort::Base(bsort) => self.desugar_base_sort(bsort, generic_id_to_var_idx),
+            surface::Sort::Func { inputs, output } => {
+                let inputs_and_output = self.genv().alloc_slice_with_capacity(
+                    inputs.len() + 1,
+                    inputs
+                        .iter()
+                        .chain(iter::once(output))
+                        .map(|sort| self.desugar_base_sort(sort, generic_id_to_var_idx)),
+                );
+                fhir::Sort::Func(fhir::PolyFuncSort::new(0, inputs_and_output))
             }
-            surface::ExprKind::Literal(lit) => {
-                fhir::ExprKind::Literal(self.desugar_lit(expr.span, *lit)?)
-            }
-            surface::ExprKind::BinaryOp(op, box [e1, e2]) => {
-                let e1 = self.desugar_expr(env, e1);
-                let e2 = self.desugar_expr(env, e2);
-                fhir::ExprKind::BinaryOp(desugar_bin_op(*op), Box::new([e1?, e2?]))
-            }
-            surface::ExprKind::UnaryOp(op, box e) => {
-                fhir::ExprKind::UnaryOp(desugar_un_op(*op), Box::new(self.desugar_expr(env, e)?))
-            }
-            surface::ExprKind::Dot(qpath, fld) => {
-                if let QPathRes::Param(ident) = self.resolve_qpath(env, qpath)? {
-                    fhir::ExprKind::Dot(ident, *fld)
+            surface::Sort::Infer => fhir::Sort::Infer,
+        }
+    }
+
+    fn desugar_base_sort(
+        &mut self,
+        sort: &surface::BaseSort,
+        generic_id_to_var_idx: Option<&FxIndexSet<DefId>>,
+    ) -> fhir::Sort<'genv> {
+        let genv = self.genv();
+        match sort {
+            surface::BaseSort::BitVec(width) => fhir::Sort::BitVec(*width),
+            surface::BaseSort::Path(surface::SortPath { segments, args, node_id }) => {
+                let res = self.resolve_path(*node_id);
+
+                // In a `RefinedBy` we resolve type parameters to a sort var
+                let res = if let fhir::Res::Def(DefKind::TyParam, def_id) = res.base_res()
+                    && let Some(generic_id_to_var_idx) = generic_id_to_var_idx
+                {
+                    let idx = generic_id_to_var_idx.get_index_of(&def_id).unwrap();
+                    fhir::PartialRes::new(fhir::Res::SortParam(idx))
                 } else {
-                    return Err(self.emit_err(errors::InvalidDotVar { span: expr.span }));
+                    res
+                };
+
+                let args = genv.alloc_slice_fill_iter(
+                    args.iter()
+                        .map(|s| self.desugar_base_sort(s, generic_id_to_var_idx)),
+                );
+
+                let path = fhir::SortPath { res, segments: genv.alloc_slice(segments), args };
+                fhir::Sort::Path(path)
+            }
+            surface::BaseSort::SortOf(qself, path) => {
+                match self.check_no_holes(qself, path) {
+                    Ok(()) => fhir::Sort::SortOf(self.desugar_path_to_bty(Some(qself), path)),
+                    Err(err) => fhir::Sort::Err(err),
                 }
             }
-            surface::ExprKind::App(func, args) => {
-                let args = self.desugar_exprs(env, args)?;
-                match self.resolve_func(env, *func)? {
-                    FuncRes::Global(fundecl) => {
-                        fhir::ExprKind::App(
-                            fhir::Func::Global(
-                                func.name,
-                                fundecl.kind,
-                                func.span,
-                                self.next_fhir_id(),
-                            ),
-                            args,
-                        )
+            surface::BaseSort::Tuple(sorts) => {
+                let sorts = genv.alloc_slice_fill_iter(
+                    sorts
+                        .iter()
+                        .map(|s| self.desugar_base_sort(s, generic_id_to_var_idx)),
+                );
+                fhir::Sort::Tuple(sorts)
+            }
+        }
+    }
+
+    fn desugar_generic_args(
+        &mut self,
+        args: &[surface::GenericArg],
+    ) -> (&'genv [fhir::GenericArg<'genv>], &'genv [fhir::AssocItemConstraint<'genv>]) {
+        let mut fhir_args = vec![];
+        let mut constraints = vec![];
+        for arg in args {
+            match &arg.kind {
+                surface::GenericArgKind::Type(ty) => {
+                    if matches!(ty.kind, surface::TyKind::Hole) {
+                        fhir_args.push(fhir::GenericArg::Infer);
+                        continue;
                     }
-                    FuncRes::Param(ident) => {
-                        let func = fhir::Func::Var(ident, self.next_fhir_id());
-                        fhir::ExprKind::App(func, args)
+                    // If the path was resolved in the value namespace then we must create a const
+                    // generic argument
+                    if let Some(path) = ty.is_potential_const_arg()
+                        && let Some(res) = self.resolve_path(path.node_id).full_res()
+                        && res.matches_ns(Namespace::ValueNS)
+                    {
+                        fhir_args.push(self.desugar_const_path_to_const_arg(path, res));
+                        continue;
                     }
+                    let ty = self.desugar_ty(ty);
+                    fhir_args.push(fhir::GenericArg::Type(self.genv().alloc(ty)));
+                }
+                surface::GenericArgKind::Constraint(ident, ty) => {
+                    constraints.push(fhir::AssocItemConstraint {
+                        ident: *ident,
+                        kind: fhir::AssocItemConstraintKind::Equality { term: self.desugar_ty(ty) },
+                    });
                 }
             }
-            surface::ExprKind::IfThenElse(box [p, e1, e2]) => {
-                let p = self.desugar_expr(env, p);
-                let e1 = self.desugar_expr(env, e1);
-                let e2 = self.desugar_expr(env, e2);
-                fhir::ExprKind::IfThenElse(Box::new([p?, e1?, e2?]))
+        }
+        (self.genv().alloc_slice(&fhir_args), self.genv().alloc_slice(&constraints))
+    }
+
+    fn desugar_const_path_to_const_arg(
+        &mut self,
+        path: &surface::Path,
+        res: fhir::Res,
+    ) -> fhir::GenericArg<'genv> {
+        let kind = self.desugar_const_path_to_const_arg_kind(path, res);
+        fhir::GenericArg::Const(fhir::ConstArg { kind, span: path.span })
+    }
+
+    fn desugar_const_path_to_const_arg_kind(
+        &mut self,
+        path: &surface::Path,
+        res: fhir::Res,
+    ) -> fhir::ConstArgKind {
+        if let Res::Def(DefKind::ConstParam, def_id) = res {
+            fhir::ConstArgKind::Param(def_id)
+        } else {
+            self.emit(errors::UnsupportedConstGenericArg::new(path.span, res.descr()));
+            fhir::ConstArgKind::Infer
+        }
+    }
+
+    /// This is the mega desugaring function [`surface::Ty`] -> [`fhir::Ty`].
+    /// These are both similar representations. The most important difference is that
+    /// [`fhir::Ty`] has explicit refinement parameters and [`surface::Ty`] does not.
+    /// Refinements are implicitly scoped in surface.
+    fn desugar_ty(&mut self, ty: &surface::Ty) -> fhir::Ty<'genv> {
+        let node_id = ty.node_id;
+        let span = ty.span;
+        let kind = match &ty.kind {
+            surface::TyKind::Base(bty) => {
+                let bty = self.desugar_bty(bty);
+                fhir::TyKind::BaseTy(bty)
+            }
+            surface::TyKind::Indexed { bty, indices } => {
+                let bty = self.desugar_bty(bty);
+                let idx = self.desugar_indices(indices);
+                fhir::TyKind::Indexed(bty, idx)
+            }
+            surface::TyKind::Exists { bind, bty, pred } => {
+                let ty_span = ty.span;
+                let bty_span = bty.span;
+
+                let bty = self.desugar_bty(bty);
+                let pred = self.desugar_expr(pred);
+
+                let (id, kind) = self.resolve_param(node_id);
+                let param = fhir::RefineParam {
+                    id,
+                    name: bind.name,
+                    span: bind.span,
+                    sort: fhir::Sort::Infer,
+                    kind,
+                    fhir_id: self.next_fhir_id(),
+                };
+                let path = fhir::PathExpr {
+                    segments: self.genv().alloc_slice(&[*bind]),
+                    res: Res::Param(kind, id),
+                    fhir_id: self.next_fhir_id(),
+                    span: bind.span,
+                };
+                let idx = fhir::Expr {
+                    kind: fhir::ExprKind::Var(QPathExpr::Resolved(path, None)),
+                    span: bind.span,
+                    fhir_id: self.next_fhir_id(),
+                };
+                let indexed = fhir::Ty { kind: fhir::TyKind::Indexed(bty, idx), span: bty_span };
+                let constr = fhir::Ty {
+                    kind: fhir::TyKind::Constr(pred, self.genv().alloc(indexed)),
+                    span: ty_span,
+                };
+                fhir::TyKind::Exists(self.genv().alloc_slice(&[param]), self.genv().alloc(constr))
+            }
+            surface::TyKind::GeneralExists { params, ty, pred } => {
+                let mut ty = self.desugar_ty(ty);
+                if let Some(pred) = pred {
+                    let pred = self.desugar_expr(pred);
+                    ty = fhir::Ty { kind: fhir::TyKind::Constr(pred, self.genv().alloc(ty)), span };
+                }
+                let params = self.desugar_refine_params(params);
+
+                fhir::TyKind::Exists(params, self.genv().alloc(ty))
+            }
+            surface::TyKind::Constr(pred, ty) => {
+                let pred = self.desugar_expr(pred);
+                let ty = self.desugar_ty(ty);
+                fhir::TyKind::Constr(pred, self.genv().alloc(ty))
+            }
+            surface::TyKind::Ref(mutbl, ty) => {
+                let ty = self.desugar_ty(ty);
+                fhir::TyKind::Ref(self.genv().alloc(ty), *mutbl)
+            }
+
+            surface::TyKind::Tuple(tys) => {
+                let tys = self
+                    .genv()
+                    .alloc_slice_fill_iter(tys.iter().map(|ty| self.desugar_ty(ty)));
+                fhir::TyKind::Tuple(tys)
+            }
+            surface::TyKind::Array(ty, len) => {
+                let ty = self.desugar_ty(ty);
+                let len = self.desugar_const_arg(len);
+                fhir::TyKind::Array(self.genv().alloc(ty), len)
+            }
+            surface::TyKind::BareFn(bare_fn) => {
+                match self.desugar_bare_fn(bare_fn) {
+                    Ok(bare_fn) => fhir::TyKind::BareFn(self.genv().alloc(bare_fn)),
+                    Err(err) => fhir::TyKind::Err(err),
+                }
+            }
+            surface::TyKind::ImplTrait(_, bounds) => self.desugar_impl_trait(bounds),
+            surface::TyKind::Hole => fhir::TyKind::Infer,
+        };
+        fhir::Ty { kind, span }
+    }
+
+    fn desugar_bare_fn(&mut self, bare_fn: &surface::BareFnTy) -> Result<fhir::BareFnTy<'genv>> {
+        let inputs = self
+            .genv()
+            .alloc_slice_fill_iter(bare_fn.inputs.iter().map(|ty| self.desugar_ty(ty)));
+        let ret = match &bare_fn.output {
+            surface::FnRetTy::Ty(ty) => self.desugar_ty(ty),
+            surface::FnRetTy::Default(span) => {
+                fhir::Ty { kind: fhir::TyKind::Tuple(&[]), span: *span }
             }
         };
-        Ok(fhir::Expr { kind, span: expr.span, fhir_id: self.next_fhir_id() })
+        let output = fhir::FnOutput { params: &[], ret, ensures: &[] };
+        let decl =
+            fhir::FnDecl { requires: &[], inputs, output, span: bare_fn.span, lifted: false };
+        let safety = match bare_fn.safety {
+            surface::Safety::Safe => hir::Safety::Safe,
+            surface::Safety::Unsafe => hir::Safety::Unsafe,
+        };
+        let abi = match bare_fn.abi {
+            None => rustc_abi::ExternAbi::Rust,
+            Some(abi) => {
+                abi.name
+                    .as_str()
+                    .parse::<rustc_abi::ExternAbi>()
+                    .map_err(|_| self.emit(errors::InvalidAbi::new(abi)))?
+            }
+        };
+        let params = self
+            .genv()
+            .alloc_slice_fill_iter(self.implicit_params_to_params(bare_fn.node_id));
+        Ok(fhir::BareFnTy {
+            params,
+            safety,
+            abi,
+            generic_params: &[],
+            decl: self.genv().alloc(decl),
+            param_idents: self
+                .genv()
+                .alloc_slice_fill_iter(bare_fn.inputs.iter().map(|_| None)),
+        })
     }
 
-    fn desugar_exprs(&self, env: &mut Env, exprs: &[surface::Expr]) -> Result<Vec<fhir::Expr>> {
-        exprs
-            .iter()
-            .map(|e| self.desugar_expr(env, e))
-            .try_collect_exhaust()
+    fn desugar_const_arg(&mut self, const_arg: &surface::ConstArg) -> fhir::ConstArg {
+        let kind = match &const_arg.kind {
+            surface::ConstArgKind::Lit(val) => fhir::ConstArgKind::Lit(*val),
+            surface::ConstArgKind::Path(path) => {
+                let res = self
+                    .resolve_path(path.node_id)
+                    .full_res()
+                    .unwrap_or(Res::Err);
+                self.desugar_const_path_to_const_arg_kind(path, res)
+            }
+            surface::ConstArgKind::Infer => fhir::ConstArgKind::Infer,
+        };
+        fhir::ConstArg { kind, span: const_arg.span }
     }
 
-    fn try_parse_int_lit(&self, span: Span, s: &str) -> Result<i128> {
+    fn desugar_bty(&mut self, bty: &surface::BaseTy) -> fhir::BaseTy<'genv> {
+        match &bty.kind {
+            surface::BaseTyKind::Path(qself, path) => {
+                let qpath = self.desugar_qpath(qself.as_deref(), path);
+                fhir::BaseTy::from_qpath(qpath, self.next_fhir_id())
+            }
+            surface::BaseTyKind::Slice(ty) => {
+                let ty = self.desugar_ty(ty);
+                let kind = fhir::BaseTyKind::Slice(self.genv().alloc(ty));
+                fhir::BaseTy { kind, fhir_id: self.next_fhir_id(), span: bty.span }
+            }
+            surface::BaseTyKind::Ptr(mutbl, ty) => {
+                let ty = self.desugar_ty(ty);
+                let kind = fhir::BaseTyKind::RawPtr(self.genv().alloc(ty), *mutbl);
+                fhir::BaseTy { kind, fhir_id: self.next_fhir_id(), span: bty.span }
+            }
+        }
+    }
+
+    fn desugar_path_to_bty(
+        &mut self,
+        qself: Option<&surface::Ty>,
+        path: &surface::Path,
+    ) -> fhir::BaseTy<'genv> {
+        let qpath = self.desugar_qpath(qself, path);
+        fhir::BaseTy::from_qpath(qpath, self.next_fhir_id())
+    }
+
+    fn desugar_qpath(
+        &mut self,
+        qself: Option<&surface::Ty>,
+        path: &surface::Path,
+    ) -> fhir::QPath<'genv> {
+        let qself = if let Some(ty) = qself {
+            let ty = self.desugar_ty(ty);
+            Some(self.genv().alloc(ty))
+        } else {
+            None
+        };
+        let partial_res = self.resolve_path(path.node_id);
+
+        let unresolved_segments = partial_res.unresolved_segments();
+
+        let proj_start = path.segments.len() - unresolved_segments;
+        let fhir_path = fhir::Path {
+            res: partial_res.base_res(),
+            fhir_id: self.next_fhir_id(),
+            segments: self.genv().alloc_slice_fill_iter(
+                path.segments[..proj_start]
+                    .iter()
+                    .map(|segment| self.desugar_path_segment(segment)),
+            ),
+            refine: self
+                .genv()
+                .alloc_slice_fill_iter(path.refine.iter().map(|arg| self.desugar_refine_arg(arg))),
+            span: path.span,
+        };
+
+        // Simple case, either no projections, or only fully-qualified.
+        // E.g., `std::mem::size_of` or `<I as Iterator>::Item`.
+        if unresolved_segments == 0 {
+            return fhir::QPath::Resolved(qself, fhir_path);
+        }
+
+        // Create the innermost type that we're projecting from.
+        let mut ty = if fhir_path.segments.is_empty() {
+            // If the base path is empty that means there exists a
+            // syntactical `Self`, e.g., `&i32` in `<&i32>::clone`.
+            qself.expect("missing QSelf for <T>::...")
+        } else {
+            // Otherwise, the base path is an implicit `Self` type path,
+            // e.g., `Vec` in `Vec::new` or `<I as Iterator>::Item` in
+            // `<I as Iterator>::Item::default`.
+            self.genv()
+                .alloc(self.ty_path(fhir::QPath::Resolved(qself, fhir_path)))
+        };
+
+        for (i, segment) in path.segments.iter().enumerate().skip(proj_start) {
+            let hir_segment = self.desugar_path_segment(segment);
+            let qpath = fhir::QPath::TypeRelative(ty, self.genv().alloc(hir_segment));
+
+            if i == path.segments.len() - 1 {
+                return qpath;
+            }
+
+            ty = self.genv().alloc(self.ty_path(qpath));
+        }
+
+        span_bug!(
+            path.span,
+            "desugar_qpath: no final extension segment in {}..{}",
+            proj_start,
+            path.segments.len()
+        );
+    }
+
+    fn desugar_path_segment(&mut self, segment: &surface::PathSegment) -> fhir::PathSegment<'genv> {
+        let res = self
+            .opt_resolve_path(segment.node_id)
+            .map_or(Res::Err, |r| r.expect_full_res());
+        let (args, constraints) = self.desugar_generic_args(&segment.args);
+        fhir::PathSegment { ident: segment.ident, res, args, constraints }
+    }
+
+    fn desugar_epath_segment(
+        &self,
+        segment: &surface::ExprPathSegment,
+    ) -> fhir::PathSegment<'genv> {
+        let res = self
+            .opt_resolve_path(segment.node_id)
+            .map_or(Res::Err, |r| r.expect_full_res());
+        fhir::PathSegment { ident: segment.ident, res, args: &[], constraints: &[] }
+    }
+
+    fn ty_path(&self, qpath: fhir::QPath<'genv>) -> fhir::Ty<'genv> {
+        fhir::Ty {
+            span: qpath.span(),
+            kind: fhir::TyKind::BaseTy(fhir::BaseTy::from_qpath(qpath, self.next_fhir_id())),
+        }
+    }
+
+    fn desugar_indices(&mut self, idxs: &surface::Indices) -> fhir::Expr<'genv> {
+        if let [arg] = &idxs.indices[..] {
+            self.desugar_refine_arg(arg)
+        } else {
+            let flds = self
+                .genv()
+                .alloc_slice_fill_iter(idxs.indices.iter().map(|arg| self.desugar_refine_arg(arg)));
+            fhir::Expr {
+                kind: fhir::ExprKind::Record(flds),
+                fhir_id: self.next_fhir_id(),
+                span: idxs.span,
+            }
+        }
+    }
+
+    fn desugar_refine_arg(&mut self, arg: &surface::RefineArg) -> fhir::Expr<'genv> {
+        match arg {
+            surface::RefineArg::Bind(ident, .., node_id) => {
+                self.implicit_param_into_refine_arg(*ident, *node_id)
+                    .unwrap()
+            }
+            surface::RefineArg::Expr(expr) => self.desugar_expr(expr),
+            surface::RefineArg::Abs(params, body, span, _) => {
+                let body = self.genv().alloc(self.desugar_expr(body));
+                let params = self.desugar_refine_params(params);
+                fhir::Expr {
+                    kind: fhir::ExprKind::Abs(params, body),
+                    fhir_id: self.next_fhir_id(),
+                    span: *span,
+                }
+            }
+        }
+    }
+
+    fn implicit_param_into_refine_arg(
+        &self,
+        ident: surface::Ident,
+        node_id: NodeId,
+    ) -> Option<fhir::Expr<'genv>> {
+        let (id, kind) = self.resolve_implicit_param(node_id)?;
+        let path = fhir::PathExpr {
+            segments: self.genv().alloc_slice(&[ident]),
+            res: Res::Param(kind, id),
+            fhir_id: self.next_fhir_id(),
+            span: ident.span,
+        };
+        Some(fhir::Expr {
+            kind: fhir::ExprKind::Var(QPathExpr::Resolved(path, Some(kind))),
+            span: ident.span,
+            fhir_id: self.next_fhir_id(),
+        })
+    }
+
+    fn desugar_quant_dom(&mut self, dom: &Option<Range<usize>>) -> fhir::QuantDom {
+        match dom {
+            Some(rng) => fhir::QuantDom::Bounded { start: rng.start, end: rng.end },
+            None => fhir::QuantDom::Unbounded,
+        }
+    }
+
+    fn desugar_expr(&mut self, expr: &surface::Expr) -> fhir::Expr<'genv> {
+        let kind = match &expr.kind {
+            surface::ExprKind::Path(path) => fhir::ExprKind::Var(self.desugar_epath(path)),
+            surface::ExprKind::Literal(lit) => self.desugar_lit(expr.span, *lit),
+            surface::ExprKind::BinaryOp(op, deref!([e1, e2])) => {
+                let e1 = self.desugar_expr(e1);
+                let e2 = self.desugar_expr(e2);
+                fhir::ExprKind::BinaryOp(*op, self.genv().alloc(e1), self.genv().alloc(e2))
+            }
+            surface::ExprKind::UnaryOp(op, deref!(e)) => {
+                fhir::ExprKind::UnaryOp(*op, self.genv().alloc(self.desugar_expr(e)))
+            }
+            surface::ExprKind::Dot(base, fld) => {
+                let base = self.desugar_expr(base);
+                fhir::ExprKind::Dot(self.genv().alloc(base), *fld)
+            }
+            surface::ExprKind::Call(callee, args) => self.desugar_call(callee, args),
+            surface::ExprKind::AssocReft(..) | surface::ExprKind::PrimUIF(..) => {
+                fhir::ExprKind::Err(self.emit(errors::UnsupportedPosition::new(expr.span)))
+            }
+            surface::ExprKind::IfThenElse(deref!([p, e1, e2])) => {
+                let p = self.desugar_expr(p);
+                let e1 = self.desugar_expr(e1);
+                let e2 = self.desugar_expr(e2);
+                fhir::ExprKind::IfThenElse(
+                    self.genv().alloc(p),
+                    self.genv().alloc(e1),
+                    self.genv().alloc(e2),
+                )
+            }
+            surface::ExprKind::Constructor(path, args) => {
+                self.desugar_constructor(path.as_ref(), args)
+            }
+            surface::ExprKind::Quant(kind, param, dom, body) => {
+                let kind = match kind {
+                    surface::QuantKind::Exists => fhir::QuantKind::Exists,
+                    surface::QuantKind::Forall => fhir::QuantKind::Forall,
+                };
+                let body = self.genv().alloc(self.desugar_expr(body));
+                let param = self.desugar_refine_param(param);
+                let rng = self.desugar_quant_dom(dom);
+                fhir::ExprKind::Quant(kind, param, rng, body)
+            }
+            surface::ExprKind::Block(decls, body) => {
+                let decls = self.genv().alloc_slice_fill_iter(decls.iter().map(|decl| {
+                    fhir::LetDecl {
+                        param: self.desugar_refine_param(&decl.param),
+                        init: self.desugar_expr(&decl.init),
+                    }
+                }));
+                let body = self.genv().alloc(self.desugar_expr(body));
+                fhir::ExprKind::Block(decls, body)
+            }
+            surface::ExprKind::SetLiteral(exprs) => {
+                let exprs = self
+                    .genv()
+                    .alloc_slice_fill_iter(exprs.iter().map(|expr| self.desugar_expr(expr)));
+                fhir::ExprKind::SetLiteral(exprs)
+            }
+            surface::ExprKind::Tuple(exprs) => {
+                let exprs = self
+                    .genv()
+                    .alloc_slice_fill_iter(exprs.iter().map(|expr| self.desugar_expr(expr)));
+                fhir::ExprKind::Tuple(exprs)
+            }
+        };
+
+        fhir::Expr { kind, span: expr.span, fhir_id: self.next_fhir_id() }
+    }
+
+    fn desugar_call(
+        &mut self,
+        callee: &surface::Expr,
+        args: &[surface::Expr],
+    ) -> fhir::ExprKind<'genv> {
+        let args = self.desugar_exprs(args);
+        match &callee.kind {
+            surface::ExprKind::Path(path) => {
+                match self.desugar_epath(path) {
+                    QPathExpr::Resolved(path, _) => fhir::ExprKind::App(path, args),
+                    QPathExpr::TypeRelative(qself, name) => {
+                        fhir::ExprKind::Alias(fhir::AliasReft::TypeRelative { qself, name }, args)
+                    }
+                }
+            }
+            surface::ExprKind::PrimUIF(op) if args.len() == 2 && self.allow_primop_app() => {
+                fhir::ExprKind::PrimApp(*op, &args[0], &args[1])
+            }
+            surface::ExprKind::AssocReft(qself, path, name) => {
+                if let Err(err) = self.check_no_holes(qself, path) {
+                    return fhir::ExprKind::Err(err);
+                }
+                let qself = self.desugar_ty(qself);
+                let fhir::QPath::Resolved(None, trait_) = self.desugar_qpath(None, path) else {
+                    span_bug!(path.span, "desugar_alias_reft: unexpected qpath")
+                };
+                let Res::Def(DefKind::Trait, _) = trait_.res else {
+                    // FIXME(nilehmann) we ought to report this error somewhere else
+                    return fhir::ExprKind::Err(self.emit(errors::InvalidAliasReft::new(path)));
+                };
+                let alias_reft = fhir::AliasReft::Qualified {
+                    qself: self.genv().alloc(qself),
+                    trait_,
+                    name: *name,
+                };
+                fhir::ExprKind::Alias(alias_reft, args)
+            }
+            _ => fhir::ExprKind::Err(self.emit(errors::UnsupportedPosition::new(callee.span))),
+        }
+    }
+
+    fn desugar_constructor(
+        &mut self,
+        path: Option<&surface::ExprPath>,
+        args: &[surface::ConstructorArg],
+    ) -> fhir::ExprKind<'genv> {
+        let path = if let Some(path) = path {
+            let Some(res @ Res::Def(DefKind::Struct | DefKind::Enum, _)) =
+                self.resolve_path(path.node_id).full_res()
+            else {
+                return fhir::ExprKind::Err(
+                    self.emit(errors::InvalidConstructorPath { span: path.span }),
+                );
+            };
+            let segments = self
+                .genv()
+                .alloc_slice_fill_iter(path.segments.iter().map(|s| s.ident));
+            Some(fhir::PathExpr { res, segments, fhir_id: self.next_fhir_id(), span: path.span })
+        } else {
+            None
+        };
+
+        let (field_exprs, spreads): (Vec<_>, Vec<_>) = args.iter().partition_map(|arg| {
+            match arg {
+                ConstructorArg::FieldExpr(e) => Either::Left(e),
+                ConstructorArg::Spread(s) => Either::Right(s),
+            }
+        });
+
+        let field_exprs = self
+            .genv()
+            .alloc_slice_fill_iter(field_exprs.iter().map(|field_expr| {
+                let e = self.desugar_refine_arg(&field_expr.expr);
+                fhir::FieldExpr {
+                    ident: field_expr.ident,
+                    expr: e,
+                    fhir_id: self.next_fhir_id(),
+                    span: e.span,
+                }
+            }));
+
+        match &spreads[..] {
+            [] => fhir::ExprKind::Constructor(path, field_exprs, None),
+            [s] => {
+                let spread = fhir::Spread {
+                    expr: self.desugar_expr(&s.expr),
+                    span: s.span,
+                    fhir_id: self.next_fhir_id(),
+                };
+                fhir::ExprKind::Constructor(path, field_exprs, Some(self.genv().alloc(spread)))
+            }
+            [s1, s2, ..] => {
+                let err = errors::MultipleSpreadsInConstructor::new(s1.span, s2.span);
+                fhir::ExprKind::Err(self.emit(err))
+            }
+        }
+    }
+
+    fn desugar_exprs(&mut self, exprs: &[surface::Expr]) -> &'genv [fhir::Expr<'genv>] {
+        self.genv()
+            .alloc_slice_fill_iter(exprs.iter().map(|e| self.desugar_expr(e)))
+    }
+
+    fn try_parse_int_lit(&self, span: Span, s: &str) -> Result<u128> {
+        let s = s.replace("_", "");
         let parsed_int = if s.len() <= 2 {
-            s.parse::<i128>()
+            s.parse::<u128>()
         } else {
             match &s[0..2] {
-                "0x" => i128::from_str_radix(&s[2..], 16), // hex
-                "0o" => i128::from_str_radix(&s[2..], 8),  // octal
-                "0b" => i128::from_str_radix(&s[2..], 2),  // binary
-                _ => s.parse::<i128>(),                    // must be decimal
+                "0x" => u128::from_str_radix(&s[2..], 16), // hex
+                "0o" => u128::from_str_radix(&s[2..], 8),  // octal
+                "0b" => u128::from_str_radix(&s[2..], 2),  // binary
+                _ => s.parse::<u128>(),                    // must be decimal
             }
         };
 
         if let Ok(n) = parsed_int {
             Ok(n) // convert error types
         } else {
-            Err(self.emit_err(errors::IntTooLarge { span }))
+            Err(self.emit(errors::IntTooLarge { span }))
         }
     }
 
-    fn desugar_lit(&self, span: Span, lit: surface::Lit) -> Result<fhir::Lit> {
-        match lit.kind {
+    /// Desugar surface literal
+    fn desugar_lit(&self, span: Span, lit: surface::Lit) -> fhir::ExprKind<'genv> {
+        let lit = match lit.kind {
             surface::LitKind::Integer => {
-                let n = self.try_parse_int_lit(span, lit.symbol.as_str())?;
-                let suffix = lit.suffix.unwrap_or(SORTS.int);
-                if suffix == SORTS.int {
-                    Ok(fhir::Lit::Int(n))
-                } else if suffix == SORTS.real {
-                    Ok(fhir::Lit::Real(n))
-                } else {
-                    Err(self.emit_err(errors::InvalidNumericSuffix::new(span, suffix)))
-                }
-            }
-            surface::LitKind::Bool => Ok(fhir::Lit::Bool(lit.symbol == kw::True)),
-            _ => Err(self.emit_err(errors::UnexpectedLiteral { span })),
-        }
-    }
-
-    fn resolve_func(&self, env: &Env, func: surface::Ident) -> Result<FuncRes<'a>> {
-        if let Some(param) = env.get(func) {
-            return Ok(FuncRes::Param(fhir::Ident::new(param.name, func)));
-        }
-        if let Some(decl) = self.genv().map().func_decl(func.name) {
-            return Ok(FuncRes::Global(decl));
-        }
-        Err(self.emit_err(errors::UnresolvedVar::from_ident(func, "function")))
-    }
-
-    fn resolve_qpath(&self, env: &Env, qpath: &surface::QPathExpr) -> Result<QPathRes<'a>> {
-        match &qpath.segments[..] {
-            [var] => {
-                if let Some(param) = env.get(*var) {
-                    return Ok(QPathRes::Param(fhir::Ident::new(param.name, *var)));
-                }
-                if let Some(const_info) = self.genv().const_by_name(var.name) {
-                    return Ok(QPathRes::Const(const_info));
-                }
-                Err(self.emit_err(errors::UnresolvedVar::from_ident(*var, "name")))
-            }
-            [typ, name] => {
-                resolve_num_const(*typ, *name).ok_or_else(|| {
-                    self.emit_err(errors::UnresolvedVar::from_qpath(qpath, "type-2"))
-                })
-            }
-            _ => Err(self.emit_err(errors::UnresolvedVar::from_qpath(qpath, "type-3"))),
-        }
-    }
-
-    fn resolve_loc(&self, env: &Env, loc: surface::Ident) -> Result<(usize, fhir::Ident)> {
-        match env.get(loc) {
-            Some(param) => {
-                let fhir::ParamKind::Loc(idx) = param.kind else {
-                    span_bug!(loc.span, "not a loc");
+                let n = match self.try_parse_int_lit(span, lit.symbol.as_str()) {
+                    Ok(n) => n,
+                    Err(err) => return fhir::ExprKind::Err(err),
                 };
-                Ok((idx, fhir::Ident::new(param.name, loc)))
+                match lit.suffix {
+                    None => fhir::Lit::Int(n),
+                    Some(suffix) => {
+                        return fhir::ExprKind::Err(
+                            self.emit(errors::InvalidNumericSuffix::new(span, suffix)),
+                        );
+                    }
+                }
             }
-            None => Err(self.emit_err(errors::UnresolvedVar::from_ident(loc, "location"))),
-        }
-    }
-
-    #[track_caller]
-    fn emit_err(&self, err: impl IntoDiagnostic<'a>) -> ErrorGuaranteed {
-        self.genv().sess.emit_err(err)
+            surface::LitKind::Float => {
+                if let Some(suffix) = lit.suffix {
+                    return fhir::ExprKind::Err(
+                        self.emit(errors::InvalidNumericSuffix::new(span, suffix)),
+                    );
+                }
+                fhir::Lit::Real(lit.symbol)
+            }
+            surface::LitKind::Bool => fhir::Lit::Bool(lit.symbol == kw::True),
+            surface::LitKind::Str => fhir::Lit::Str(lit.symbol),
+            surface::LitKind::Char => {
+                // Use rustc's literal parsing to correctly handle escape sequences, e.g., `'\n'`
+                match ast::LitKind::from_token_lit(lit) {
+                    Ok(ast::LitKind::Char(c)) => fhir::Lit::Char(c),
+                    _ => return fhir::ExprKind::Err(self.emit(errors::UnexpectedLiteral { span })),
+                }
+            }
+            _ => return fhir::ExprKind::Err(self.emit(errors::UnexpectedLiteral { span })),
+        };
+        fhir::ExprKind::Literal(lit)
     }
 }
 
-impl<'a, 'tcx> DesugarCtxt<'a, 'tcx> for RustItemCtxt<'a, 'tcx> {
+impl<'genv, 'tcx> DesugarCtxt<'genv, 'tcx> for RustItemCtxt<'_, 'genv, 'tcx> {
     fn next_fhir_id(&self) -> FhirId {
         FhirId { owner: FluxOwnerId::Rust(self.owner), local_id: self.local_id_gen.fresh() }
     }
 
-    fn genv(&self) -> &'a GlobalEnv<'a, 'tcx> {
+    fn genv(&self) -> GlobalEnv<'genv, 'tcx> {
         self.genv
+    }
+
+    fn resolver_output(&self) -> &'genv ResolverOutput {
+        self.resolver_output
+    }
+
+    fn desugar_impl_trait(&mut self, bounds: &[surface::TraitRef]) -> fhir::TyKind<'genv> {
+        // If there's more than one opaque it will fail when collecting it so we can unwrap here
+        let def_id = self.opaque.unwrap();
+
+        // FIXME(nilehmann) since we can only pass local ids for opaque types it means we can't
+        // support extern specs with opaque types.
+        let opaque_ty = self.desugar_opaque_ty_for_impl_trait(def_id, bounds);
+        let opaque_ty = self.insert_opaque_ty(opaque_ty);
+
+        fhir::TyKind::OpaqueDef(opaque_ty)
     }
 }
 
-impl<'a, 'tcx> DesugarCtxt<'a, 'tcx> for FluxItemCtxt<'a, 'tcx> {
+impl<'genv, 'tcx> DesugarCtxt<'genv, 'tcx> for FluxItemCtxt<'genv, 'tcx> {
     fn next_fhir_id(&self) -> FhirId {
         FhirId { owner: FluxOwnerId::Flux(self.owner), local_id: self.local_id_gen.fresh() }
     }
 
-    fn genv(&self) -> &'a GlobalEnv<'a, 'tcx> {
+    fn allow_primop_app(&self) -> bool {
+        self.allow_primop_app
+    }
+
+    fn genv(&self) -> GlobalEnv<'genv, 'tcx> {
         self.genv
+    }
+
+    fn resolver_output(&self) -> &'genv ResolverOutput {
+        self.resolver_output
+    }
+
+    fn desugar_impl_trait(&mut self, _: &[surface::TraitRef]) -> fhir::TyKind<'genv> {
+        unimplemented!("`impl Trait` not supported in this item")
     }
 }
 
-macro_rules! define_resolve_num_const {
-    ($($typ:ident),*) => {
-        fn resolve_num_const(typ: surface::Ident, name: surface::Ident) -> Option<QPathRes<'static>> {
-            match typ.name.as_str() {
-                $(
-                    stringify!($typ) => {
-                        match name.name.as_str() {
-                            "MAX" => Some(QPathRes::NumConst($typ::MAX.try_into().unwrap())),
-                            "MIN" => Some(QPathRes::NumConst($typ::MIN.try_into().unwrap())),
-                            _ => None,
-                        }
-                    },
-                )*
-                _ => None
-            }
+/// Traverses the `hir` for an item and collects the `def_id` of any opaque type (i.e., `impl Trait` or `async`)
+/// Currently, we only support up to one opaque type and we report an error if there's more than one.
+fn collect_opaque_types(
+    genv: GlobalEnv,
+    owner_id: MaybeExternId<OwnerId>,
+) -> Result<Option<LocalDefId>> {
+    let mut collector = OpaqueTypeCollector::new(genv.sess());
+    match genv.tcx().hir_owner_node(owner_id.local_id()) {
+        hir::OwnerNode::Item(item) => hir::intravisit::walk_item(&mut collector, item),
+        hir::OwnerNode::ImplItem(impl_item) => {
+            hir::intravisit::walk_impl_item(&mut collector, impl_item);
         }
+        hir::OwnerNode::TraitItem(trait_item) => {
+            hir::intravisit::walk_trait_item(&mut collector, trait_item);
+        }
+        hir::OwnerNode::ForeignItem(_) | hir::OwnerNode::Crate(_) | hir::OwnerNode::Synthetic => {}
     };
+    collector.into_result()
 }
 
-define_resolve_num_const!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
+struct OpaqueTypeCollector<'sess> {
+    opaque: Option<LocalDefId>,
+    errors: Errors<'sess>,
+}
+
+impl<'sess> OpaqueTypeCollector<'sess> {
+    fn new(sess: &'sess FluxSession) -> Self {
+        Self { opaque: None, errors: Errors::new(sess) }
+    }
+
+    fn into_result(self) -> Result<Option<LocalDefId>> {
+        self.errors.into_result()?;
+        Ok(self.opaque)
+    }
+}
+
+impl<'tcx> hir::intravisit::Visitor<'tcx> for OpaqueTypeCollector<'_> {
+    fn visit_ty(&mut self, ty: &'tcx hir::Ty<'tcx, rustc_hir::AmbigArg>) {
+        if let hir::TyKind::OpaqueDef(opaque_ty, ..) = ty.kind {
+            if self.opaque.is_some() {
+                self.errors.emit(errors::UnsupportedSignature {
+                    span: ty.span,
+                    note: "duplicate opaque types in signature",
+                });
+            } else {
+                self.opaque = Some(opaque_ty.def_id);
+            }
+        }
+        hir::intravisit::walk_ty(self, ty);
+    }
+}

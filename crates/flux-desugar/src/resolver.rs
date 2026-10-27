@@ -1,665 +1,1814 @@
-use flux_common::{bug, iter::IterExt};
-use flux_errors::FluxSession;
-use flux_middle::fhir::Res;
-use flux_syntax::surface::{self, AliasPred, BaseTy, BaseTyKind, Ident, Path, Pred, PredKind, Ty};
-use hir::{def::DefKind, ItemId, ItemKind, OwnerId, PathSegment};
+pub(crate) mod refinement_resolver;
+
+use std::collections::hash_map;
+
+use flux_common::{
+    bug,
+    result::{ErrorCollector, ErrorEmitter, ResultExt},
+};
+use flux_errors::Errors;
+use flux_middle::{
+    FluxItemDecl, ResolverOutput, Specs,
+    def_id::{FluxDefId, FluxLocalDefId, MaybeExternId},
+    fhir,
+    fhir::{
+        Namespace::{self, *},
+        PerNS,
+    },
+    global_env::GlobalEnv,
+};
+use flux_syntax::{
+    surface::{self, Ident, visit::Visitor as _},
+    symbols::sym,
+};
+use hir::{ItemId, ItemKind, OwnerId, def::DefKind};
 use itertools::Itertools;
-use rustc_data_structures::unord::UnordMap;
+use rustc_data_structures::unord::{ExtendUnord, UnordMap};
 use rustc_errors::ErrorGuaranteed;
-use rustc_hir as hir;
-use rustc_middle::ty::TyCtxt;
-use rustc_span::Span;
+use rustc_hir::{
+    self as hir, CRATE_OWNER_ID, ParamName, PrimTy, def::CtorOf, def_id::CRATE_DEF_ID,
+};
+use rustc_middle::{middle::resolve::ModChild, ty::TyCtxt};
+use rustc_span::{Span, Symbol, def_id::DefId, symbol::kw};
+
+use self::refinement_resolver::{ImplicitParamCollector, RefinementResolver};
 
 type Result<T = ()> = std::result::Result<T, ErrorGuaranteed>;
 
-pub struct Resolver<'a, 'tcx> {
-    tcx: TyCtxt<'tcx>,
-    sess: &'a FluxSession,
+/// The reason a name lookup (`resolve_ident_with_ribs`, `resolve_ident_in_module`,
+/// `resolve_path_with_ribs`) failed.
+enum ResolveError {
+    NotFound,
+    /// The name resolved to two or more distinct, competing bindings (e.g. two different glob
+    /// imports bringing in different items under the same name) with nothing more specific to
+    /// disambiguate. Carries everything needed to emit [`errors::AmbiguousName`], so that callers
+    /// deep in the path walk don't have to reconstruct which segment went wrong.
+    Ambiguous(Ambiguity),
+    /// The name resolved to a generic parameter (or `Self`) of an outer item.
+    OuterGeneric(Span),
+}
+
+impl ResolveError {
+    /// Emits the error. A [`ResolveError::NotFound`] is reported with the diagnostic built by
+    /// `not_found`, since only the caller knows what was being looked for.
+    #[track_caller]
+    fn emit<'a, D: rustc_errors::Diagnostic<'a>>(
+        self,
+        emitter: &'a impl ErrorEmitter,
+        not_found: impl FnOnce() -> D,
+    ) -> ErrorGuaranteed {
+        match self {
+            Self::NotFound => emitter.emit(not_found()),
+            Self::Ambiguous(ambiguity) => emitter.emit(errors::AmbiguousName::new(ambiguity)),
+            Self::OuterGeneric(span) => emitter.emit(errors::OuterGeneric { span }),
+        }
+    }
+}
+
+/// A name that two competing glob imports bind to different items:
+///
+/// ```ignore
+/// mod a { pub struct S; }
+/// mod b { pub struct S; }
+///
+/// use a::*;
+/// use b::*;
+///
+/// #[flux::spec(fn(x: S))]
+/// fn f(x: a::S) {}
+/// ```
+#[derive(Clone, Copy, Debug)]
+struct Ambiguity {
+    /// The use site that hit the ambiguity: the `S` inside the signature.
+    span: Span,
+    /// The contested name: `S`.
+    name: Symbol,
+    /// Where the first candidate was brought into scope: the `use a::*;` statement.
+    first: Span,
+    /// Same for the second candidate: `use b::*;`. It can coincide with `first` when a single
+    /// glob imports a module that is itself ambiguously re-exporting the name.
+    second: Span,
+}
+
+pub(crate) fn resolve_crate(genv: GlobalEnv) -> ResolverOutput {
+    match try_resolve_crate(genv) {
+        Ok(output) => output,
+        Err(err) => genv.sess().abort(err),
+    }
+}
+
+fn try_resolve_crate(genv: GlobalEnv) -> Result<ResolverOutput> {
+    let specs = genv.collect_specs();
+    let mut resolver = CrateResolver::new(genv, specs);
+
+    genv.tcx().hir_walk_toplevel_module(&mut resolver);
+
+    resolver.into_output()
+}
+
+pub(crate) struct CrateResolver<'genv, 'tcx> {
+    genv: GlobalEnv<'genv, 'tcx>,
+    specs: &'genv Specs,
     output: ResolverOutput,
+    ribs: PerNS<Vec<Rib>>,
+    /// A mapping from the names of all imported crates to their [`DefId`]
+    crates: UnordMap<Symbol, DefId>,
+    /// Names available everywhere: Rust builtin types plus flux's global funcs (theory funcs, `cast`)
+    /// and primitive sorts.
+    prelude: PerNS<Rib>,
+    qualifiers: UnordMap<Symbol, FluxLocalDefId>,
+    primop_props: UnordMap<Symbol, FluxDefId>,
+    err: Option<ErrorGuaranteed>,
+    /// The most recent module we have visited. Used to check for visibility of other items from
+    /// this module.
+    current_module: OwnerId,
 }
 
+/// Map to keep track of names defined in a scope
 #[derive(Default)]
-pub struct ResolverOutput {
-    pub path_res_map: UnordMap<surface::NodeId, Res>,
-    pub impl_trait_res_map: UnordMap<surface::NodeId, ItemId>,
+struct DefinitionMap {
+    defined: UnordMap<Ident, ()>,
 }
 
-impl<'a, 'tcx> Resolver<'a, 'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, sess: &'a FluxSession) -> Self {
-        Self { tcx, sess, output: ResolverOutput::default() }
+impl DefinitionMap {
+    fn define(&mut self, name: Ident) -> std::result::Result<(), errors::DuplicateDefinition> {
+        match self.defined.entry(name) {
+            hash_map::Entry::Occupied(entry) => {
+                Err(errors::DuplicateDefinition {
+                    span: name.span,
+                    previous_definition: entry.key().span,
+                    name: name.name,
+                })
+            }
+            hash_map::Entry::Vacant(entry) => {
+                entry.insert(());
+                Ok(())
+            }
+        }
+    }
+}
+
+impl<'genv, 'tcx> CrateResolver<'genv, 'tcx> {
+    pub fn new(genv: GlobalEnv<'genv, 'tcx>, specs: &'genv Specs) -> Self {
+        Self {
+            genv,
+            output: ResolverOutput::default(),
+            specs,
+            ribs: PerNS { type_ns: vec![], value_ns: vec![], macro_ns: vec![], flux_fn_ns: vec![] },
+            crates: mk_crate_mapping(genv.tcx()),
+            prelude: PerNS {
+                type_ns: builtin_types_rib(),
+                value_ns: Rib::new(RibKind::Misc),
+                macro_ns: Rib::new(RibKind::Misc),
+                flux_fn_ns: theory_funcs_rib(),
+            },
+            err: None,
+            qualifiers: Default::default(),
+            primop_props: Default::default(),
+            current_module: CRATE_OWNER_ID,
+        }
     }
 
-    pub fn into_output(self) -> ResolverOutput {
-        self.output
+    /// Qualifiers and primop-props are global, so their names are checked for duplicates across
+    /// the whole crate (unlike other flux items, which are scoped to the module or block declaring
+    /// them via [`Self::define_res_in`]).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "`flux_items_by_scope` is the source of truth for `FluxDefId`"
+    )]
+    fn define_flux_global_items(&mut self) {
+        let mut definitions = DefinitionMap::default();
+        for decls in self.specs.flux_items_by_scope.values() {
+            for FluxItemDecl { declarer, item } in decls {
+                // We are putting qualifiers, primops and axioms in the same namespace.
+                match item {
+                    surface::FluxItem::Qualifier(qual) => {
+                        let ident = qual.name;
+                        if definitions
+                            .define(ident)
+                            .emit(&self.genv)
+                            .collect_err(&mut self.err)
+                            .is_some()
+                        {
+                            let def_id = FluxLocalDefId::new(declarer.def_id, ident.name);
+                            self.qualifiers.insert(ident.name, def_id);
+                        }
+                    }
+                    surface::FluxItem::PrimOpProp(primop) => {
+                        let ident = primop.name;
+                        if definitions
+                            .define(ident)
+                            .emit(&self.genv)
+                            .collect_err(&mut self.err)
+                            .is_some()
+                        {
+                            let def_id = FluxDefId::new(declarer.to_def_id(), ident.name);
+                            self.primop_props.insert(ident.name, def_id);
+                        }
+                    }
+                    surface::FluxItem::Axiom(axiom) => {
+                        let _ = definitions
+                            .define(axiom.name)
+                            .emit(&self.genv)
+                            .collect_err(&mut self.err);
+                    }
+                    surface::FluxItem::Use(_)
+                    | surface::FluxItem::FuncDef(_)
+                    | surface::FluxItem::SortDecl(_) => {}
+                };
+            }
+        }
     }
 
-    pub fn resolve_type_alias(
+    /// Defines the flux items declared in `scope` (a module or a block) in the innermost rib.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "`flux_items_by_scope` is the source of truth for `FluxDefId`"
+    )]
+    fn define_flux_items(&mut self, scope: hir::HirId) {
+        let Some(decls) = self.specs.flux_items_by_scope.get(&scope) else { return };
+        for FluxItemDecl { declarer, item } in decls {
+            match item {
+                surface::FluxItem::Qualifier(_)
+                | surface::FluxItem::PrimOpProp(_)
+                | surface::FluxItem::Axiom(_) => {
+                    // Already registered in `define_global_qualifiers_and_primop_props`.
+                }
+                surface::FluxItem::FuncDef(defn) => {
+                    let def_id = FluxDefId::new(declarer.to_def_id(), defn.name.name);
+                    let kind = fhir::SpecFuncKind::Def(def_id);
+                    self.define_res_in(
+                        fhir::Res::GlobalFunc(kind),
+                        ReftNS,
+                        BindingSource::Explicit(defn.name),
+                    );
+                }
+                surface::FluxItem::SortDecl(sort_decl) => {
+                    let def_id = FluxDefId::new(declarer.to_def_id(), sort_decl.name.name);
+                    self.define_res_in(
+                        fhir::Res::UserSort(def_id),
+                        TypeNS,
+                        BindingSource::Explicit(sort_decl.name),
+                    );
+                }
+                surface::FluxItem::Use(use_tree) => {
+                    // Flux's `use` has no glob form, so every name it brings in is explicit.
+                    for (ident, res, ns) in self.resolve_flux_use_tree(use_tree) {
+                        self.define_res_in(res, ns, BindingSource::Explicit(ident));
+                    }
+                }
+            }
+        }
+    }
+
+    fn define_items(&mut self, item_ids: impl IntoIterator<Item = &'tcx ItemId>) {
+        for item_id in item_ids {
+            let item = self.genv.tcx().hir_item(*item_id);
+            let def_kind = match item.kind {
+                ItemKind::Use(use_tree) => {
+                    let is_prelude = is_prelude_import(self.genv.tcx(), item);
+                    self.define_use_tree(&use_tree, &mut vec![], is_prelude, item.span);
+                    continue;
+                }
+                ItemKind::ForeignMod { items, .. } => {
+                    self.define_foreign_items(items);
+                    continue;
+                }
+                ItemKind::TyAlias(..)
+                | ItemKind::Enum(..)
+                | ItemKind::Struct(..)
+                | ItemKind::Union(..)
+                | ItemKind::Trait { .. }
+                | ItemKind::Mod(..)
+                | ItemKind::Const(..) => self.genv.def_kind(item.owner_id),
+                _ => continue,
+            };
+            if let Some(ns) = def_kind.ns().map(Namespace::from)
+                && let Some(ident) = item.kind.ident()
+            {
+                self.define_res_in(
+                    fhir::Res::Def(def_kind, item.owner_id.to_def_id()),
+                    ns,
+                    BindingSource::Explicit(ident),
+                );
+            }
+        }
+    }
+
+    fn define_foreign_items(&mut self, items: &[rustc_hir::ForeignItemId]) {
+        for item_id in items {
+            let item = self.genv.tcx().hir_foreign_item(*item_id);
+            match item.kind {
+                rustc_hir::ForeignItemKind::Type => {
+                    self.define_res_in(
+                        fhir::Res::Def(DefKind::ForeignTy, item.owner_id.to_def_id()),
+                        TypeNS,
+                        BindingSource::Explicit(item.ident),
+                    );
+                }
+                rustc_hir::ForeignItemKind::Fn(..) | rustc_hir::ForeignItemKind::Static(..) => {}
+            }
+        }
+    }
+
+    /// Define the name in `source` in the innermost rib of `ns`.
+    fn define_res_in(
         &mut self,
-        owner_id: OwnerId,
-        alias_def: &surface::TyAlias,
-    ) -> Result {
-        ItemLikeResolver::new(self.tcx, self.sess, owner_id, &mut self.output)?
-            .resolve_ty(&alias_def.ty)
+        res: fhir::Res<surface::NodeId>,
+        ns: Namespace,
+        source: BindingSource,
+    ) {
+        let ident = source.ident();
+        if ident.name == kw::Underscore {
+            return;
+        }
+        let entry = self.ribs[ns]
+            .last_mut()
+            .unwrap()
+            .bindings
+            .entry(ident.name)
+            .or_default();
+
+        if let Some(prev) = entry.define(source, res) {
+            if let fhir::Res::Param(..) = prev.res {
+                self.emit(errors::DuplicateParam {
+                    span: ident.span,
+                    name: ident.name,
+                    first_use: prev.span,
+                });
+            } else {
+                self.emit(errors::DuplicateDefinition {
+                    span: ident.span,
+                    previous_definition: prev.span,
+                    name: ident.name,
+                });
+            }
+        }
     }
 
-    pub fn resolve_struct_def(
+    /// Define `ident` in the prelude of `ns`. The prelude is only ever populated from the single
+    /// `#[prelude_import]` glob, so unlike [`Self::define_res_in`] it keeps plain last-one-wins
+    /// semantics: there is no second glob to be ambiguous with.
+    fn define_in_prelude(&mut self, ident: Ident, res: fhir::Res<surface::NodeId>, ns: Namespace) {
+        self.prelude[ns]
+            .bindings
+            .insert(ident.name, NameResolution::from_explicit(Binding { span: ident.span, res }));
+    }
+
+    fn push_rib(&mut self, ns: Namespace, kind: RibKind) {
+        self.ribs[ns].push(Rib::new(kind));
+    }
+
+    fn pop_rib(&mut self, ns: Namespace) {
+        self.ribs[ns].pop();
+    }
+
+    fn define_generics(&mut self, def_id: MaybeExternId<OwnerId>) {
+        let generics = self
+            .genv
+            .tcx()
+            .hir_get_generics(def_id.local_id().def_id)
+            .unwrap();
+        for param in generics.params {
+            let def_kind = self.genv.tcx().def_kind(param.def_id);
+            if let ParamName::Plain(name) = param.name
+                && let Some(ns) = def_kind.ns().map(Namespace::from)
+            {
+                debug_assert!(matches!(def_kind, DefKind::TyParam | DefKind::ConstParam));
+                let param_id = self.genv.maybe_extern_id(param.def_id).resolved_id();
+                self.define_res_in(
+                    fhir::Res::Def(def_kind, param_id),
+                    ns,
+                    BindingSource::Explicit(name),
+                );
+            }
+        }
+    }
+
+    fn resolve_flux_items(&mut self, scope: hir::HirId) {
+        let Some(decls) = self.specs.flux_items_by_scope.get(&scope) else { return };
+        for ns in [TypeNS, ValueNS, ReftNS] {
+            self.push_rib(ns, RibKind::Item);
+        }
+        for FluxItemDecl { item, .. } in decls {
+            self.resolve_flux_item(item, MaybeExternId::Local(scope.owner))
+                .collect_err(&mut self.err);
+        }
+        for ns in [TypeNS, ValueNS, ReftNS] {
+            self.pop_rib(ns);
+        }
+    }
+
+    fn resolve_flux_item(
         &mut self,
-        owner_id: OwnerId,
-        struct_def: &surface::StructDef,
+        item: &surface::FluxItem,
+        parent: MaybeExternId<OwnerId>,
     ) -> Result {
-        if !struct_def.needs_resolving() {
+        if let surface::FluxItem::Use(_) = item {
+            // Use paths are resolved `CrateResolver::resolve_flux_use_tree`
             return Ok(());
         }
+        ItemResolver::run(self, parent, |vis| vis.visit_flux_item(item))?;
+        // Sort variables share the type namespace with sorts/types (see [`fhir::Namespace`]).
+        self.push_rib(TypeNS, RibKind::Misc);
+        for (idx, ident) in item.sort_vars().iter().enumerate() {
+            self.define_res_in(fhir::Res::SortParam(idx), TypeNS, BindingSource::Explicit(*ident));
+        }
+        let result =
+            RefinementResolver::run(self, Default::default(), |vis| vis.visit_flux_item(item));
+        self.pop_rib(TypeNS);
+        result
+    }
 
-        let mut item_resolver =
-            ItemLikeResolver::new(self.tcx, self.sess, owner_id, &mut self.output)?;
-        struct_def.fields.iter().try_for_each_exhaust(|ty| {
-            if let Some(ty) = ty {
-                item_resolver.resolve_ty(ty)?;
+    fn resolve_item(&mut self, item: &surface::Item, item_id: MaybeExternId<OwnerId>) -> Result {
+        ItemResolver::run(self, item_id, |vis| vis.visit_item(item))?;
+        let params = ImplicitParamCollector::run(self, |vis| vis.visit_item(item))?;
+        RefinementResolver::run(self, params, |vis| vis.visit_item(item))
+    }
+
+    fn resolve_trait_item(
+        &mut self,
+        item: &surface::TraitItemFn,
+        item_id: MaybeExternId<OwnerId>,
+    ) -> Result {
+        ItemResolver::run(self, item_id, |vis| vis.visit_trait_item(item))?;
+        let params = ImplicitParamCollector::run(self, |vis| vis.visit_trait_item(item))?;
+        RefinementResolver::run(self, params, |vis| vis.visit_trait_item(item))
+    }
+
+    fn resolve_impl_item(
+        &mut self,
+        item: &surface::ImplItemFn,
+        item_id: MaybeExternId<OwnerId>,
+    ) -> Result {
+        ItemResolver::run(self, item_id, |vis| vis.visit_impl_item(item))?;
+        let params = ImplicitParamCollector::run(self, |vis| vis.visit_impl_item(item))?;
+        RefinementResolver::run(self, params, |vis| vis.visit_impl_item(item))
+    }
+
+    fn resolve_path_with_ribs<S: Segment>(
+        &mut self,
+        segments: &[S],
+        ns: Namespace,
+    ) -> std::result::Result<fhir::PartialRes<surface::NodeId>, ResolveError> {
+        let result = self.resolve_path_with_ribs_inner(segments, ns);
+        let fallback = match &result {
+            Ok(res) => matches!(res.full_res(), Some(fhir::Res::Def(DefKind::Mod, _))),
+            Err(ResolveError::NotFound) => true,
+            Err(ResolveError::Ambiguous(_) | ResolveError::OuterGeneric(_)) => false,
+        };
+        // Retry a primitive when ordinary lookup finds a module or fails.
+        // See: https://github.com/rust-lang/rust/blob/12c4d3f34dcb4715784d2fa0e8443853e0592194/compiler/rustc_resolve/src/late.rs#L5069-L5071
+        if fallback
+            && (ns == TypeNS || (ns == ValueNS && segments.len() > 1))
+            && let Some(first) = segments.first()
+        {
+            let name = first.ident().name;
+            let prim = PrimTy::from_name(name).map(fhir::Res::PrimTy).or_else(|| {
+                fhir::PrimSort::ALL
+                    .into_iter()
+                    .find(|sort| sort.name() == name)
+                    .map(fhir::Res::PrimSort)
+            });
+            if let Some(res) = prim {
+                S::record_segment_res(self, first, res);
+                return Ok(fhir::PartialRes::with_unresolved_segments(res, segments.len() - 1));
             }
-            Ok(())
+        }
+        result
+    }
+
+    /// Ordinary path lookup, also used for imports where modules must not become primitives.
+    fn resolve_path_with_ribs_inner<S: Segment>(
+        &mut self,
+        segments: &[S],
+        ns: Namespace,
+    ) -> std::result::Result<fhir::PartialRes<surface::NodeId>, ResolveError> {
+        let mut module: Option<Module> = None;
+        for (segment_idx, segment) in segments.iter().enumerate() {
+            let is_last = segment_idx + 1 == segments.len();
+            let ns = if is_last { ns } else { TypeNS };
+
+            let base_res = if let Some(module) = module {
+                self.resolve_ident_in_module(module, segment.ident(), ns)?
+            } else {
+                self.resolve_ident_with_ribs(segment.ident(), ns)?
+            };
+
+            S::record_segment_res(self, segment, base_res);
+
+            if is_last {
+                return Ok(fhir::PartialRes::new(base_res));
+            }
+
+            match base_res {
+                fhir::Res::Def(DefKind::Mod, module_id) => {
+                    module = Some(Module::new(ModuleKind::Mod, module_id));
+                }
+                fhir::Res::Def(DefKind::Trait, module_id) => {
+                    module = Some(Module::new(ModuleKind::Trait, module_id));
+                }
+                fhir::Res::Def(DefKind::Enum, module_id) => {
+                    module = Some(Module::new(ModuleKind::Enum, module_id));
+                }
+                _ => {
+                    return Ok(fhir::PartialRes::with_unresolved_segments(
+                        base_res,
+                        segments.len() - segment_idx - 1,
+                    ));
+                }
+            }
+        }
+        Err(ResolveError::NotFound)
+    }
+
+    fn resolve_flux_use_tree(
+        &mut self,
+        use_tree: &surface::UseTree,
+    ) -> Vec<(Ident, fhir::Res<surface::NodeId>, Namespace)> {
+        self.resolve_flux_use_tree_rec(use_tree, None, &mut vec![])
+    }
+
+    fn resolve_flux_use_tree_rec(
+        &mut self,
+        use_tree: &surface::UseTree,
+        mut resolved_module_id: Option<DefId>,
+        resolved_prefix: &mut Vec<Ident>,
+    ) -> Vec<(Ident, fhir::Res<surface::NodeId>, Namespace)> {
+        let Some((last, all_but_last)) = use_tree.prefix.segments.split_last() else {
+            bug!("path must have at least one segment")
+        };
+        let module_segments = match &use_tree.kind {
+            surface::UseTreeKind::Simple => all_but_last,
+            surface::UseTreeKind::Nested(_) => &use_tree.prefix.segments[..],
+        };
+
+        for segment in module_segments {
+            let ident = segment.ident();
+            let res = if let Some(module_id) = resolved_module_id {
+                let module = Module::new(ModuleKind::Mod, module_id);
+                self.resolve_ident_in_module(module, ident, TypeNS)
+            } else {
+                self.resolve_ident_with_ribs(ident, TypeNS)
+            };
+            let res = match res {
+                Ok(res) => res,
+                Err(err) => {
+                    self.emit_resolve_err(err, || {
+                        errors::UnresolvedImport::new(ident, resolved_module_id, resolved_prefix)
+                    });
+                    return vec![];
+                }
+            };
+            if let fhir::Res::Def(DefKind::Mod, def_id) = res {
+                resolved_module_id = Some(def_id);
+            } else {
+                self.emit_not_a_module(ident, resolved_prefix);
+                return vec![];
+            }
+            resolved_prefix.push(ident);
+        }
+
+        match &use_tree.kind {
+            surface::UseTreeKind::Simple => {
+                let mut resolutions = vec![];
+                // An import names an item in every namespace at once, so an ambiguity in any one
+                // of them is an error even if the others resolve. Keeping only the first means one
+                // import is one error.
+                let mut error = None;
+                for ns in [TypeNS, ValueNS, ReftNS] {
+                    let res = if let Some(module_id) = resolved_module_id {
+                        let module = Module::new(ModuleKind::Mod, module_id);
+                        self.resolve_ident_in_module(module, last.ident(), ns)
+                    } else {
+                        self.resolve_ident_with_ribs(last.ident(), ns)
+                    };
+                    match res {
+                        Ok(res) => resolutions.push((last.ident(), res, ns)),
+                        Err(ResolveError::NotFound) => {}
+                        Err(err) => error = error.or(Some(err)),
+                    }
+                }
+                if resolutions.is_empty() {
+                    error = error.or(Some(ResolveError::NotFound));
+                }
+                if let Some(err) = error {
+                    self.emit_resolve_err(err, || {
+                        errors::UnresolvedImport::new(
+                            last.ident,
+                            resolved_module_id,
+                            resolved_prefix,
+                        )
+                    });
+                }
+                resolutions
+            }
+            surface::UseTreeKind::Nested(items) => {
+                let mut resolutions = vec![];
+                for item in items {
+                    let len = resolved_prefix.len();
+                    resolutions.extend(self.resolve_flux_use_tree_rec(
+                        item,
+                        resolved_module_id,
+                        resolved_prefix,
+                    ));
+                    resolved_prefix.truncate(len);
+                }
+                resolutions
+            }
+        }
+    }
+
+    fn resolve_ident_with_ribs(
+        &self,
+        ident: Ident,
+        ns: Namespace,
+    ) -> std::result::Result<fhir::Res<surface::NodeId>, ResolveError> {
+        let mut ribs = self.ribs[ns].iter().rev();
+        let mut crossed_item = false;
+        while let Some(rib) = ribs.next() {
+            // An ambiguous name is still a name: it stops the climb here rather than falling
+            // through to outer scopes or the prelude.
+            if let Some(name_res) = rib.bindings.get(&ident.name)
+                && let Some(res) = name_res.resolve(ident)
+            {
+                // Like in rust, nested items cannot mention generics of outer items
+                let res = res.map_err(ResolveError::Ambiguous)?;
+                if crossed_item
+                    && matches!(
+                        res,
+                        fhir::Res::Def(DefKind::TyParam | DefKind::ConstParam, _)
+                            | fhir::Res::SelfTyParam { .. }
+                            | fhir::Res::SelfTyAlias { .. }
+                    )
+                {
+                    return Err(ResolveError::OuterGeneric(ident.span));
+                }
+                return Ok(res);
+            }
+            match rib.kind {
+                // A module boundary stops item resolution.
+                RibKind::Module => break,
+                RibKind::Item => crossed_item = true,
+                // A variant is a barrier that hides refinement params bound in the `refined_by` *enclosing*
+                // scope, but not other refinement bindings in other scopes (e.g. flux funcs in the parent module).
+                // FIXME: this is skipping potential names defined inside a `const _ = { ... }` or other similar
+                // "transparent modules".
+                RibKind::Variant => {
+                    ribs.take_while_ref(|rib| !matches!(rib.kind, RibKind::Module))
+                        .for_each(drop);
+                }
+                _ => {}
+            }
+        }
+        if ns == TypeNS {
+            if let Some(crate_id) = self.crates.get(&ident.name) {
+                return Ok(fhir::Res::Def(DefKind::Mod, *crate_id));
+            }
+            // FIXME: `crate`, `self` and `super` should only be allowed as the first segment
+            if ident.name == kw::Crate {
+                return Ok(fhir::Res::Def(DefKind::Mod, CRATE_DEF_ID.to_def_id()));
+            }
+            if ident.name == kw::SelfLower {
+                return Ok(fhir::Res::Def(DefKind::Mod, self.current_module.to_def_id()));
+            }
+            if ident.name == kw::Super
+                && let Some(parent) = self.genv.tcx().opt_local_parent(self.current_module.def_id)
+            {
+                return Ok(fhir::Res::Def(DefKind::Mod, parent.to_def_id()));
+            }
+        }
+
+        if let Some(name_res) = self.prelude[ns].bindings.get(&ident.name)
+            && let Some(res) = name_res.resolve(ident)
+        {
+            return res.map_err(ResolveError::Ambiguous);
+        }
+        Err(ResolveError::NotFound)
+    }
+
+    /// Defines the names brought into scope by a `use` tree. `prefix` accumulates the segments of
+    /// the enclosing nested trees, because the path of a nested tree is relative to its parent.
+    fn define_use_tree(
+        &mut self,
+        use_tree: &hir::UseTree<'tcx>,
+        prefix: &mut Vec<hir::PathSegment<'tcx>>,
+        is_prelude: bool,
+        glob_span: Span,
+    ) {
+        let path = use_tree.prefix;
+        match use_tree.kind {
+            hir::UseKind::Single(mut ident) => {
+                // For a nested `self` import, e.g., `use foo::{self}`, rustc doesn't strip the
+                // `self` because the path of the nested tree is relative. The name it defines is
+                // the last segment of the enclosing prefix (`foo`).
+                if ident.name == kw::SelfLower
+                    && let Some(last) = prefix.last()
+                {
+                    ident = Ident::new(last.ident.name, ident.span);
+                }
+                if let Some(res) = path.res.value_ns
+                    && let Ok(res) = fhir::Res::try_from(res)
+                {
+                    self.define_res_in(res, ValueNS, BindingSource::Explicit(ident));
+                }
+                if let Some(res) = path.res.type_ns
+                    && let Ok(res) = fhir::Res::try_from(res)
+                {
+                    self.define_res_in(res, TypeNS, BindingSource::Explicit(ident));
+                }
+            }
+            hir::UseKind::Glob => {
+                let len = prefix.len();
+                prefix.extend_from_slice(path.segments);
+                for mod_child in self.glob_imports(prefix) {
+                    if let Ok(res) = fhir::Res::try_from(mod_child.res)
+                        && let Some(ns @ (TypeNS | ValueNS)) = res.ns()
+                    {
+                        if is_prelude {
+                            self.define_in_prelude(mod_child.ident, res, ns);
+                        } else {
+                            let source = BindingSource::Glob { ident: mod_child.ident, glob_span };
+                            self.define_res_in(res, ns, source);
+                        }
+                    }
+                }
+                prefix.truncate(len);
+            }
+            hir::UseKind::Nested { items } => {
+                let len = prefix.len();
+                prefix.extend_from_slice(path.segments);
+                for (nested, _, _) in items {
+                    self.define_use_tree(nested, prefix, is_prelude, glob_span);
+                }
+                prefix.truncate(len);
+            }
+        }
+    }
+
+    fn glob_imports(
+        &mut self,
+        segments: &[hir::PathSegment<'tcx>],
+    ) -> impl Iterator<Item = &'tcx ModChild> + use<'tcx> {
+        // The path for the prelude import is not resolved anymore after <https://github.com/rust-lang/rust/pull/145322>,
+        // so we resolve all paths here. If this ever causes problems, we could use the resolution in the `UsePath` for
+        // non-prelude glob imports.
+        let tcx = self.genv.tcx();
+        let curr_mod = self.current_module.to_def_id();
+        self.resolve_path_with_ribs_inner(segments, TypeNS)
+            .ok()
+            .and_then(|partial_res| partial_res.full_res())
+            .and_then(|res| {
+                if let fhir::Res::Def(DefKind::Mod, module_id) = res {
+                    Some(module_id)
+                } else {
+                    None
+                }
+            })
+            .into_iter()
+            .flat_map(move |module_id| visible_module_children(tcx, module_id, curr_mod))
+    }
+
+    fn resolve_ident_in_module(
+        &self,
+        module: Module,
+        ident: Ident,
+        ns: Namespace,
+    ) -> std::result::Result<fhir::Res<surface::NodeId>, ResolveError> {
+        let tcx = self.genv.tcx();
+        let res = match module.kind {
+            ModuleKind::Mod => {
+                let module_id = module.def_id;
+                let current_mod = self.current_module.to_def_id();
+
+                // Three sources, tried in order, first one with the name wins: the module's Rust
+                // children, then the ambiguous ones rustc leaves out of `module_children`, then
+                // its flux items. Only the first two have a Rust namespace to look in.
+                //
+                // Keeping them apart matters because the folds below read every candidate as a
+                // glob, so one pool would make `mod m { struct Bag; defs! { opaque sort Bag; } }`
+                // ambiguous at each `m::Bag`. It isn't: two explicit definitions clash as a
+                // duplicate definition, already reported when `m`'s rib was built.
+                let mut resolution: NameResolution = ns
+                    .to_rustc()
+                    .into_iter()
+                    .flat_map(|rustc_ns| {
+                        visible_module_children(tcx, module_id, current_mod).filter(move |child| {
+                            child.res.matches_ns(rustc_ns)
+                                && tcx.hygienic_eq(ident, child.ident, current_mod)
+                        })
+                    })
+                    .filter_map(|child| {
+                        Some(Binding {
+                            span: child.ident.span,
+                            res: fhir::Res::try_from(child.res).ok()?,
+                        })
+                    })
+                    .collect();
+                if resolution.is_empty() {
+                    // Still a Rust name, so it comes before any flux item.
+                    if let Some(ambiguity) = self.ambiguous_module_child(module_id, ident, ns) {
+                        return Err(ResolveError::Ambiguous(ambiguity));
+                    }
+                    resolution = self
+                        .genv
+                        .flux_module_children(module_id)
+                        .iter()
+                        .filter(|child| {
+                            child.res.ns() == Some(ns) && child.ident.name == ident.name
+                        })
+                        .map(|child| {
+                            Binding {
+                                span: child.ident.span,
+                                res: child.res.map_param_id(|id| match id {}),
+                            }
+                        })
+                        .collect();
+                }
+                resolution.resolve(ident)
+            }
+            ModuleKind::Trait => {
+                // Associated items are Rust items, so we only ever resolve them in a Rust namespace.
+                ns.to_rustc()
+                    .and_then(|rustc_ns| {
+                        let trait_id = module.def_id;
+                        tcx.associated_items(trait_id)
+                            .find_by_ident_and_namespace(tcx, ident, rustc_ns, trait_id)
+                            .map(|assoc| fhir::Res::Def(assoc.kind.as_def_kind(), assoc.def_id))
+                    })
+                    .map(Ok)
+            }
+            ModuleKind::Enum => {
+                tcx.adt_def(module.def_id)
+                    .variants()
+                    .iter()
+                    .find(|data| data.name == ident.name)
+                    .and_then(|data| {
+                        let (kind, def_id) = match (ns, data.ctor) {
+                            (TypeNS, _) => (DefKind::Variant, data.def_id),
+                            (ValueNS, Some((ctor_kind, ctor_id))) => {
+                                (DefKind::Ctor(CtorOf::Variant, ctor_kind), ctor_id)
+                            }
+                            _ => return None,
+                        };
+                        Some(fhir::Res::Def(kind, def_id))
+                    })
+                    .map(Ok)
+            }
+        };
+        match res {
+            Some(res) => res.map_err(ResolveError::Ambiguous),
+            None => Err(ResolveError::NotFound),
+        }
+    }
+
+    /// The ambiguity for `ident` in `module_id`, if the module's *own* glob re-exports bind the
+    /// name to two different items (`mod m { pub use a::*; pub use b::*; }`). rustc keeps such
+    /// bindings out of `module_children` — they go into a separate `ambig_module_children` map —
+    /// so they need their own lookup.
+    ///
+    /// Only *local* modules are covered. The data for a foreign module is reachable only through an
+    /// untracked `CStore` accessor, and rustc doesn't report `E0659` across a crate boundary
+    /// anyway: it resolves to the first candidate and fires the `ambiguous_glob_imports`
+    /// future-incompatibility lint instead (see rust-lang/rust#114095). We report those as
+    /// unresolved.
+    #[expect(clippy::disallowed_methods, reason = "modules cannot have extern specs")]
+    fn ambiguous_module_child(
+        &self,
+        module_id: DefId,
+        ident: Ident,
+        ns: Namespace,
+    ) -> Option<Ambiguity> {
+        let tcx = self.genv.tcx();
+        let module_id = module_id.as_local()?;
+        let rustc_ns = ns.to_rustc()?;
+        let current_mod = self.current_module.to_def_id();
+        let child = tcx
+            .resolutions(())
+            .ambig_module_children
+            .get(&module_id)?
+            .iter()
+            .find(|child| {
+                child.main.res.matches_ns(rustc_ns)
+                    && tcx.hygienic_eq(ident, child.main.ident, current_mod)
+                    && child.main.vis.is_accessible_from(current_mod, tcx)
+            })?;
+        Some(Ambiguity {
+            span: ident.span,
+            name: ident.name,
+            first: self.glob_span(&child.main),
+            second: self.glob_span(&child.second),
         })
     }
 
-    pub fn resolve_enum_def(&mut self, owner_id: OwnerId, enum_def: &surface::EnumDef) -> Result {
-        if !enum_def.needs_resolving() {
-            return Ok(());
-        }
-
-        let mut item_resolver =
-            ItemLikeResolver::new(self.tcx, self.sess, owner_id, &mut self.output)?;
-        enum_def
-            .variants
-            .iter()
-            .try_for_each_exhaust(|variant| item_resolver.resolve_variant(variant.as_ref()))
+    /// Where a module child was brought into its module: the `use ...::*;` statement it was
+    /// re-exported by, or the item's own definition. Mirrors rustc's `child_span`.
+    fn glob_span(&self, child: &ModChild) -> Span {
+        let def_id = child
+            .reexport_chain
+            .first()
+            .and_then(|reexport| reexport.id())
+            .unwrap_or_else(|| child.res.def_id());
+        self.genv.tcx().def_span(def_id)
     }
 
-    pub fn resolve_fn_sig(&mut self, owner_id: OwnerId, fn_sig: &surface::FnSig) -> Result {
-        let mut item_resolver =
-            ItemLikeResolver::new(self.tcx, self.sess, owner_id, &mut self.output)?;
-        let asyncness = item_resolver.resolve_asyncness(&fn_sig.asyncness);
+    pub fn into_output(self) -> Result<ResolverOutput> {
+        self.err.into_result()?;
+        Ok(self.output)
+    }
 
-        let args = fn_sig
-            .args
-            .iter()
-            .try_for_each_exhaust(|arg| item_resolver.resolve_arg(arg));
+    #[track_caller]
+    fn emit_resolve_err<D: rustc_errors::Diagnostic<'genv>>(
+        &mut self,
+        err: ResolveError,
+        not_found: impl FnOnce() -> D,
+    ) {
+        self.err.collect(err.emit(self.genv.sess(), not_found));
+    }
 
-        let ensures = fn_sig
-            .ensures
-            .iter()
-            .try_for_each_exhaust(|cstr| item_resolver.resolve_constraint(cstr));
+    fn emit_not_a_module(&mut self, ident: Ident, resolved_prefix: &[Ident]) {
+        let name = Segment::format_iter(resolved_prefix.iter().chain(&[ident]));
+        self.emit(errors::UnresolvedImport {
+            span: ident.span,
+            name,
+            reason: format!("`{ident}` is not a module"),
+        });
+    }
 
-        let predicates = fn_sig
-            .generics
-            .predicates
-            .iter()
-            .try_for_each_exhaust(|pred| item_resolver.resolve_where_bound_predicate(pred));
-
-        let returns = item_resolver.resolve_fn_ret_ty(&fn_sig.returns);
-
-        asyncness?;
-        args?;
-        returns?;
-        predicates?;
-        ensures?;
-
-        Ok(())
+    #[track_caller]
+    fn emit(&mut self, err: impl rustc_errors::Diagnostic<'genv>) {
+        self.err.collect(self.genv.sess().emit_err(err));
     }
 }
 
-struct ItemLikeResolver<'a> {
-    sess: &'a FluxSession,
-    table: NameResTable<'a>,
-    output: &'a mut ResolverOutput,
-}
+impl<'tcx> hir::intravisit::Visitor<'tcx> for CrateResolver<'_, 'tcx> {
+    type NestedFilter = rustc_middle::hir::nested_filter::All;
 
-#[derive(Hash, Eq, PartialEq, Debug)]
-pub struct ResKey {
-    s: String,
-}
-
-struct NameResTable<'sess> {
-    res: UnordMap<ResKey, ResEntry>,
-    opaque: Option<ItemId>, // TODO: HACK! need to generalize to multiple opaque types/impls in a signature.
-    sess: &'sess FluxSession,
-}
-
-#[derive(Debug)]
-enum ResEntry {
-    Res(Res),
-    Unsupported { reason: String, span: Span },
-}
-
-impl<'a> ItemLikeResolver<'a> {
-    fn new(
-        tcx: TyCtxt,
-        sess: &'a FluxSession,
-        owner_id: OwnerId,
-        output: &'a mut ResolverOutput,
-    ) -> Result<Self> {
-        let table = match tcx.hir().owner(owner_id) {
-            hir::OwnerNode::Item(item) => NameResTable::from_item(tcx, sess, item)?,
-            hir::OwnerNode::ImplItem(impl_item) => {
-                NameResTable::from_impl_item(tcx, sess, impl_item)?
-            }
-            hir::OwnerNode::TraitItem(trait_item) => {
-                NameResTable::from_trait_item(tcx, sess, trait_item)?
-            }
-            node @ (hir::OwnerNode::ForeignItem(_) | hir::OwnerNode::Crate(_)) => {
-                bug!("unsupported node {node:?}")
-            }
-        };
-
-        Ok(Self { sess, table, output })
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.genv.tcx()
     }
 
-    fn resolve_variant(&mut self, variant_def: Option<&surface::VariantDef>) -> Result {
-        if let Some(variant_def) = variant_def {
-            variant_def
-                .fields
-                .iter()
-                .try_for_each_exhaust(|ty| self.resolve_ty(ty))?;
-            if let Some(ret) = &variant_def.ret {
-                self.resolve_variant_ret(ret)?;
-            }
+    fn visit_mod(
+        &mut self,
+        module: &'tcx hir::Mod<'tcx>,
+        _s: Span,
+        mod_id: hir::def_id::LocalModId,
+    ) {
+        let owner_id = OwnerId { def_id: mod_id.to_local_def_id() };
+        let old_mod = self.current_module;
+        self.current_module = owner_id;
+        self.push_rib(TypeNS, RibKind::Module);
+        self.push_rib(ValueNS, RibKind::Module);
+        self.push_rib(ReftNS, RibKind::Module);
+
+        self.define_items(module.item_ids);
+
+        // Flux primops and wualifiers are made globally available as if they were defined at the top of the crate
+        if mod_id.is_top_level_module() {
+            self.define_flux_global_items();
         }
-        Ok(())
+        // Other items are defined in the module they are declared in.
+        let scope = hir::HirId::make_owner(owner_id.def_id);
+        self.define_flux_items(scope);
+
+        self.resolve_flux_items(scope);
+        hir::intravisit::walk_mod(self, module);
+
+        self.pop_rib(ReftNS);
+        self.pop_rib(ValueNS);
+        self.pop_rib(TypeNS);
+        self.current_module = old_mod;
     }
 
-    fn resolve_variant_ret(&mut self, ret: &surface::VariantRet) -> Result {
-        self.resolve_path(&ret.path)
+    fn visit_block(&mut self, block: &'tcx hir::Block<'tcx>) {
+        self.push_rib(TypeNS, RibKind::Misc);
+        self.push_rib(ValueNS, RibKind::Misc);
+        self.push_rib(ReftNS, RibKind::Misc);
+
+        let item_ids = block.stmts.iter().filter_map(|stmt| {
+            if let hir::StmtKind::Item(item_id) = &stmt.kind { Some(item_id) } else { None }
+        });
+        self.define_items(item_ids);
+        self.define_flux_items(block.hir_id);
+
+        self.resolve_flux_items(block.hir_id);
+        hir::intravisit::walk_block(self, block);
+
+        self.pop_rib(ReftNS);
+        self.pop_rib(ValueNS);
+        self.pop_rib(TypeNS);
     }
 
-    fn resolve_where_bound_predicate(&mut self, pred: &surface::WhereBoundPredicate) -> Result {
-        self.resolve_ty(&pred.bounded_ty)?;
-        self.resolve_bounds(&pred.bounds)
-    }
-
-    fn resolve_bounds(&mut self, bounds: &surface::GenericBounds) -> Result {
-        bounds
-            .iter()
-            .try_for_each_exhaust(|trait_ref| self.resolve_trait_ref(trait_ref))
-    }
-
-    fn resolve_trait_ref(&mut self, trait_ref: &surface::TraitRef) -> Result {
-        self.resolve_path(&trait_ref.path)
-    }
-
-    fn resolve_constraint(&mut self, cstr: &surface::Constraint) -> Result {
-        match cstr {
-            surface::Constraint::Type(_, ty) => self.resolve_ty(ty),
-            surface::Constraint::Pred(_) => Ok(()),
+    fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) {
+        if self.genv.is_dummy(item.owner_id.def_id) {
+            return;
         }
-    }
+        let def_id = self
+            .genv
+            .maybe_extern_id(item.owner_id.def_id)
+            .map(|def_id| OwnerId { def_id });
 
-    fn resolve_asyncness(&mut self, asyncness: &surface::Async) -> Result {
-        match asyncness {
-            surface::Async::Yes { node_id, span } => self.resolve_opaque_impl(*node_id, *span),
-            surface::Async::No => Ok(()),
-        }
-    }
+        self.push_rib(TypeNS, RibKind::Item);
+        self.push_rib(ValueNS, RibKind::Item);
 
-    fn resolve_arg(&mut self, arg: &surface::Arg) -> Result {
-        match arg {
-            surface::Arg::Constr(_, path, _) => self.resolve_path(path),
-            surface::Arg::StrgRef(_, ty) => self.resolve_ty(ty),
-            surface::Arg::Ty(_, ty) => self.resolve_ty(ty),
-        }
-    }
-
-    fn resolve_fn_ret_ty(&mut self, returns: &surface::FnRetTy) -> Result {
-        match returns {
-            surface::FnRetTy::Default(_) => Ok(()),
-            surface::FnRetTy::Ty(ty) => self.resolve_ty(ty),
-        }
-    }
-
-    fn resolve_alias_pred(&mut self, alias_pred: &AliasPred) -> Result {
-        self.resolve_path(&alias_pred.trait_id)?;
-        alias_pred
-            .generic_args
-            .iter()
-            .try_for_each_exhaust(|arg| self.resolve_generic_arg(arg))
-    }
-
-    fn resolve_pred(&mut self, pred: &Pred) -> Result {
-        match &pred.kind {
-            PredKind::Expr(_) => Ok(()),
-            PredKind::Alias(alias_pred, _) => self.resolve_alias_pred(alias_pred),
-        }
-    }
-
-    fn resolve_ty(&mut self, ty: &Ty) -> Result {
-        match &ty.kind {
-            surface::TyKind::Base(bty) => {
-                // CODESYNC(type-holes, 3) we don't resolve type holes because they will be desugared
-                // to `fhir::TyKind::Hole`. The path won't have an entry in `path_res_map` which we
-                // should consider during desugaring. Holes in other positions (e.g., _[10] or _{v: v > 0})
-                // will fail resolving so they don't show up in desugaring.
-                if let BaseTyKind::Path(path) = &bty.kind
-                    && path.is_hole()
-                {
-                    Ok(())
-                } else {
-                    self.resolve_bty(bty)
-                }
-            }
-            surface::TyKind::Indexed { bty, .. } => self.resolve_bty(bty),
-            surface::TyKind::Exists { bty, pred, .. } => {
-                self.resolve_bty(bty)?;
-                self.resolve_pred(pred)
-            }
-            surface::TyKind::GeneralExists { ty, .. } => self.resolve_ty(ty),
-            surface::TyKind::Ref(_, ty) => self.resolve_ty(ty),
-            surface::TyKind::Constr(pred, ty) => {
-                self.resolve_pred(pred)?;
-                self.resolve_ty(ty)
-            }
-            surface::TyKind::Tuple(tys) => {
-                tys.iter().try_for_each_exhaust(|ty| self.resolve_ty(ty))
-            }
-            surface::TyKind::Array(ty, _) => self.resolve_ty(ty),
-            surface::TyKind::ImplTrait(node_id, bounds) => {
-                self.resolve_bounds(bounds)?;
-                self.resolve_opaque_impl(*node_id, ty.span)
-            }
-        }
-    }
-
-    fn resolve_opaque_impl(&mut self, node_id: surface::NodeId, span: Span) -> Result {
-        if let Some(def_id) = self.table.opaque {
-            self.output.impl_trait_res_map.insert(node_id, def_id);
-            Ok(())
-        } else {
-            Err(self
-                .sess
-                .emit_err(errors::UnresolvedPath { span, path: "opaque type".into() }))
-        }
-    }
-
-    fn resolve_bty(&mut self, bty: &BaseTy) -> Result {
-        match &bty.kind {
-            BaseTyKind::Path(path) => self.resolve_path(path),
-            BaseTyKind::Slice(ty) => self.resolve_ty(ty),
-        }
-    }
-
-    fn resolve_generic_arg(&mut self, arg: &surface::GenericArg) -> Result {
-        match arg {
-            surface::GenericArg::Type(ty) => self.resolve_ty(ty),
-            surface::GenericArg::Constraint(_, ty) => self.resolve_ty(ty),
-        }
-    }
-
-    fn resolve_path(&mut self, path: &Path) -> Result {
-        let Some(res) = self.table.get(&ResKey::from_path(path)) else {
-            return Err(self.sess.emit_err(errors::UnresolvedPath::new(path)));
-        };
-        match res {
-            &ResEntry::Res(res) => {
-                self.output.path_res_map.insert(path.node_id, res);
-                path.generics
-                    .iter()
-                    .try_for_each_exhaust(|arg| self.resolve_generic_arg(arg))
-            }
-            ResEntry::Unsupported { reason, span } => {
-                return Err(self
-                    .sess
-                    .emit_err(errors::UnsupportedSignature::new(*span, reason)))
-            }
-        }
-    }
-}
-
-impl<'sess> NameResTable<'sess> {
-    fn new(sess: &'sess FluxSession) -> NameResTable<'sess> {
-        NameResTable { sess, opaque: None, res: UnordMap::default() }
-    }
-
-    fn from_item(tcx: TyCtxt, sess: &'sess FluxSession, item: &hir::Item) -> Result<Self> {
-        let mut table = Self::new(sess);
-        let def_id = item.owner_id.def_id;
-        match &item.kind {
-            ItemKind::TyAlias(ty, _) => {
-                table.collect_from_ty(ty)?;
-            }
-            ItemKind::Struct(data, _) => {
-                table.insert(
-                    ResKey::from_ident(item.ident),
-                    Res::Def(DefKind::Struct, def_id.to_def_id()),
+        match item.kind {
+            ItemKind::Trait { .. } => {
+                self.define_generics(def_id);
+                self.define_res_in(
+                    fhir::Res::SelfTyParam { trait_: def_id.resolved_id() },
+                    TypeNS,
+                    BindingSource::Explicit(Ident::with_dummy_span(kw::SelfUpper)),
                 );
-
-                for field in data.fields() {
-                    table.collect_from_ty(field.ty)?;
-                }
             }
-            ItemKind::Enum(data, _) => {
-                table.insert(
-                    ResKey::from_ident(item.ident),
-                    Res::Def(DefKind::Enum, def_id.to_def_id()),
+            ItemKind::Impl(hir::Impl { of_trait, .. }) => {
+                self.define_generics(def_id);
+                self.define_res_in(
+                    fhir::Res::SelfTyAlias {
+                        alias_to: def_id.resolved_id(),
+                        is_trait_impl: of_trait.is_some(),
+                    },
+                    TypeNS,
+                    BindingSource::Explicit(Ident::with_dummy_span(kw::SelfUpper)),
                 );
-
-                for variant in data.variants {
-                    for field in variant.data.fields() {
-                        table.collect_from_ty(field.ty)?;
-                    }
-                }
             }
-            ItemKind::Fn(fn_sig, generics, ..) => {
-                table.collect_from_fn_sig(fn_sig)?;
-                table.collect_from_generics(generics)?;
-                table.collect_from_opaque_impls(tcx)?;
+            ItemKind::TyAlias(..) => {
+                self.define_generics(def_id);
+            }
+            ItemKind::Enum(..) => {
+                self.define_generics(def_id);
+                self.define_res_in(
+                    fhir::Res::SelfTyAlias { alias_to: def_id.resolved_id(), is_trait_impl: false },
+                    TypeNS,
+                    BindingSource::Explicit(Ident::with_dummy_span(kw::SelfUpper)),
+                );
+            }
+            ItemKind::Struct(..) => {
+                self.define_generics(def_id);
+                self.define_res_in(
+                    fhir::Res::SelfTyAlias { alias_to: def_id.resolved_id(), is_trait_impl: false },
+                    TypeNS,
+                    BindingSource::Explicit(Ident::with_dummy_span(kw::SelfUpper)),
+                );
+            }
+            ItemKind::Fn { .. } => {
+                self.define_generics(def_id);
             }
             _ => {}
         }
-        Ok(table)
-    }
-
-    fn from_impl_item(
-        tcx: TyCtxt,
-        sess: &'sess FluxSession,
-        impl_item: &hir::ImplItem,
-    ) -> Result<Self> {
-        let def_id = impl_item.owner_id.def_id;
-
-        let mut table = Self::new(sess);
-
-        table.collect_from_generics(impl_item.generics)?;
-
-        // Insert generics from parent impl
-        if let Some(parent_impl_did) = tcx.impl_of_method(def_id.to_def_id()) {
-            let parent_impl_item = tcx.hir().expect_item(parent_impl_did.expect_local());
-            if let ItemKind::Impl(parent) = &parent_impl_item.kind {
-                table.collect_from_generics(parent.generics)?;
-                table.collect_from_ty(parent.self_ty)?;
-            }
+        if let Some(item) = self.specs.get_item(def_id.local_id()) {
+            self.resolve_item(item, def_id).collect_err(&mut self.err);
         }
 
-        match &impl_item.kind {
-            rustc_hir::ImplItemKind::Fn(fn_sig, _) => {
-                table.collect_from_fn_sig(fn_sig)?;
-                table.collect_from_opaque_impls(tcx)?;
-            }
-            rustc_hir::ImplItemKind::Const(_, _) | rustc_hir::ImplItemKind::Type(_) => {}
+        hir::intravisit::walk_item(self, item);
+
+        self.pop_rib(ValueNS);
+        self.pop_rib(TypeNS);
+    }
+
+    fn visit_impl_item(&mut self, impl_item: &'tcx hir::ImplItem<'tcx>) {
+        let def_id = self
+            .genv
+            .maybe_extern_id(impl_item.owner_id.def_id)
+            .map(|def_id| OwnerId { def_id });
+
+        // Generics are defined in both namespaces (const params live in the value namespace), so
+        // we need a rib in each to avoid leaking them into sibling items.
+        self.push_rib(TypeNS, RibKind::Misc);
+        self.push_rib(ValueNS, RibKind::Misc);
+        if let Some(item) = self.specs.get_impl_item(def_id.local_id()) {
+            self.define_generics(def_id);
+            self.resolve_impl_item(item, def_id)
+                .collect_err(&mut self.err);
         }
-
-        Ok(table)
+        hir::intravisit::walk_impl_item(self, impl_item);
+        self.pop_rib(ValueNS);
+        self.pop_rib(TypeNS);
     }
 
-    fn from_trait_item(
-        tcx: TyCtxt,
-        sess: &'sess FluxSession,
-        trait_item: &hir::TraitItem,
-    ) -> Result<Self> {
-        let def_id = trait_item.owner_id.def_id;
+    fn visit_trait_item(&mut self, trait_item: &'tcx hir::TraitItem<'tcx>) {
+        let def_id = self
+            .genv
+            .maybe_extern_id(trait_item.owner_id.def_id)
+            .map(|def_id| OwnerId { def_id });
 
-        let mut table = Self::new(sess);
-
-        // Insert generics from parent trait
-        if let Some(parent_impl_did) = tcx.trait_of_item(def_id.to_def_id()) {
-            let parent_impl_item = tcx.hir().expect_item(parent_impl_did.expect_local());
-
-            // Insert NAME of parent trait
-            if let ItemKind::Trait(_, _, _, _, _) = &parent_impl_item.kind {
-                table.insert(
-                    ResKey::from_ident(parent_impl_item.ident),
-                    Res::Def(DefKind::Trait, parent_impl_did),
-                );
-            }
-
-            if let ItemKind::Impl(parent) = &parent_impl_item.kind {
-                table.collect_from_ty(parent.self_ty)?;
-            }
+        // Generics are defined in both namespaces (const params live in the value namespace), so
+        // we need a rib in each to avoid leaking them into sibling items.
+        self.push_rib(TypeNS, RibKind::Misc);
+        self.push_rib(ValueNS, RibKind::Misc);
+        if let Some(item) = self.specs.get_trait_item(def_id.local_id()) {
+            self.define_generics(def_id);
+            self.resolve_trait_item(item, def_id)
+                .collect_err(&mut self.err);
         }
+        hir::intravisit::walk_trait_item(self, trait_item);
+        self.pop_rib(ValueNS);
+        self.pop_rib(TypeNS);
+    }
+}
 
-        match &trait_item.kind {
-            rustc_hir::TraitItemKind::Fn(fn_sig, _) => {
-                table.collect_from_fn_sig(fn_sig)?;
-                table.collect_from_opaque_impls(tcx)?;
-            }
-            rustc_hir::TraitItemKind::Const(..) | rustc_hir::TraitItemKind::Type(..) => {}
+/// Akin to `rustc_resolve::Module` but specialized to what we support
+#[derive(Clone, Copy, Debug)]
+struct Module {
+    kind: ModuleKind,
+    def_id: DefId,
+}
+
+impl Module {
+    fn new(kind: ModuleKind, def_id: DefId) -> Self {
+        Self { kind, def_id }
+    }
+}
+
+/// Akin to `rustc_resolve::ModuleKind` but specialized to what we support
+#[derive(Clone, Copy, Debug)]
+enum ModuleKind {
+    Mod,
+    Trait,
+    Enum,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RibKind {
+    /// An rib with no special rules.
+    Misc,
+    /// A module boundary. This is a barrier for item resolution.
+    Module,
+    /// An item boundary. Generic parameters (and `Self`) of outer items are not visible past it.
+    Item,
+    /// An enum variant. This is a barrier scope because variants are nested within `refined_by`
+    /// params.
+    Variant,
+}
+
+/// The value stored for each binding in a [`Rib`]. Lookups and clash detection are keyed by the
+/// name in the [`Rib`]'s map, so all a binding carries is where it came from, for diagnostics that
+/// point at the previous location of a name.
+#[derive(Clone, Copy, Debug)]
+struct Binding {
+    /// Where the name was brought into scope: the item, generic or param itself, or, for a
+    /// glob-imported binding, the `use ...::*;` statement rather than the imported item's
+    /// declaration, matching where rustc points its `E0659` notes.
+    span: Span,
+    res: fhir::Res<surface::NodeId>,
+}
+
+/// How a name was brought into a rib. Explicit definitions (items, generics, params, single
+/// `use`s, flux `use`s) shadow glob imports of the same name in the same namespace, regardless of
+/// declaration order; only globs can be ambiguous with each other.
+#[derive(Clone, Copy, Debug)]
+enum BindingSource {
+    /// A name written where it is defined: an item, generic, param or single `use`.
+    Explicit(Ident),
+    /// A glob-imported name: the imported item's ident, plus the span of the `use ...::*;`
+    /// statement that brought it in, which is the one diagnostics cite.
+    Glob { ident: Ident, glob_span: Span },
+}
+
+impl BindingSource {
+    fn ident(self) -> Ident {
+        match self {
+            BindingSource::Explicit(ident) | BindingSource::Glob { ident, .. } => ident,
         }
-
-        Ok(table)
     }
 
-    fn insert(&mut self, key: ResKey, res: impl Into<ResEntry>) {
-        self.res.insert(key, res.into());
-    }
-
-    fn get(&self, key: &ResKey) -> Option<&ResEntry> {
-        self.res.get(key)
-    }
-
-    fn collect_from_generics(&mut self, generics: &hir::Generics<'_>) -> Result {
-        generics
-            .predicates
-            .iter()
-            .try_for_each_exhaust(|pred| self.collect_from_where_predicate(pred))
-    }
-
-    fn collect_from_where_predicate(&mut self, clause: &hir::WherePredicate) -> Result {
-        if let hir::WherePredicate::BoundPredicate(bound) = clause {
-            self.collect_from_ty(bound.bounded_ty)?;
-            self.collect_from_generic_bounds(bound.bounds)?;
-        }
-        Ok(())
-    }
-
-    fn collect_from_generic_bounds(&mut self, bounds: &[hir::GenericBound<'_>]) -> Result {
-        bounds
-            .iter()
-            .try_for_each_exhaust(|b| self.collect_from_generic_bound(b))?;
-        Ok(())
-    }
-
-    fn collect_from_generic_bound(&mut self, bound: &hir::GenericBound) -> Result {
-        match bound {
-            hir::GenericBound::Trait(poly_trait_ref, _) => {
-                self.collect_from_path(poly_trait_ref.trait_ref.path)
-            }
-            hir::GenericBound::LangItemTrait(.., args) => self.collect_from_generic_args(args),
-            _ => Ok(()),
+    /// Where the name was brought into scope.
+    fn span(self) -> Span {
+        match self {
+            BindingSource::Explicit(ident) => ident.span,
+            BindingSource::Glob { glob_span, .. } => glob_span,
         }
     }
+}
 
-    fn collect_from_opaque_impls(&mut self, tcx: TyCtxt) -> Result {
-        if let Some(item_id) = self.opaque {
-            let item_kind = tcx.hir().item(item_id).kind;
-            if let ItemKind::OpaqueTy(opaque_ty) = item_kind {
-                self.collect_from_generic_bounds(opaque_ty.bounds)?;
-            }
-        }
-        Ok(())
+/// The glob-imported candidate(s) for a name, mirroring rustc's `glob_decl` slot.
+#[derive(Clone, Copy, Debug)]
+enum GlobBinding {
+    Single(Binding),
+    /// Two competing globs bound this name to different items. Frozen once set: further
+    /// candidates never change it. We deliberately diverge from rustc here, which keeps updating
+    /// the second span as new distinct competitors show up; with three or more globs we therefore
+    /// report the first two rather than the first and the last.
+    Ambiguous(Span, Span),
+}
+
+/// All candidates for a single name in a single namespace, split into the two slots
+/// (`non_glob_decl`/`glob_decl`). The non-glob slot always wins.
+#[derive(Clone, Copy, Debug, Default)]
+struct NameResolution {
+    non_glob: Option<Binding>,
+    glob: Option<GlobBinding>,
+}
+
+impl NameResolution {
+    fn from_explicit(binding: Binding) -> Self {
+        Self { non_glob: Some(binding), glob: None }
     }
 
-    fn collect_from_fn_sig(&mut self, fn_sig: &hir::FnSig) -> Result {
-        fn_sig
-            .decl
-            .inputs
-            .iter()
-            .try_for_each_exhaust(|ty| self.collect_from_ty(ty))?;
-
-        if let hir::FnRetTy::Return(ty) = fn_sig.decl.output {
-            self.collect_from_ty(ty)?;
-        }
-        Ok(())
+    fn is_empty(&self) -> bool {
+        self.non_glob.is_none() && self.glob.is_none()
     }
 
-    fn collect_from_ty(&mut self, ty: &hir::Ty) -> Result {
-        match &ty.kind {
-            hir::TyKind::Slice(ty) | hir::TyKind::Array(ty, _) => self.collect_from_ty(ty),
-            hir::TyKind::Ptr(mut_ty) | hir::TyKind::Ref(_, mut_ty) => {
-                self.collect_from_ty(mut_ty.ty)
-            }
-            hir::TyKind::Tup(tys) => tys.iter().try_for_each(|ty| self.collect_from_ty(ty)),
-            hir::TyKind::Path(qpath) => {
-                match qpath {
-                    hir::QPath::Resolved(self_ty, path) => {
-                        self.collect_from_path(path)?;
-                        if let Some(self_ty) = self_ty {
-                            self.collect_from_ty(self_ty)?;
-                        }
-                    }
-                    hir::QPath::TypeRelative(ty, _path_segment) => {
-                        self.collect_from_ty(ty)?;
-                    }
-                    hir::QPath::LangItem(..) => {}
-                }
-                Ok(())
-            }
-            hir::TyKind::OpaqueDef(item_id, ..) => {
-                assert!(self.opaque.is_none());
-                if self.opaque.is_some() {
-                    Err(self.sess.emit_err(errors::UnsupportedSignature::new(
-                        ty.span,
-                        "duplicate opaque types in signature",
-                    )))
+    /// Define the binding. Return previously defined binding if there's a clash
+    fn define(
+        &mut self,
+        source: BindingSource,
+        res: fhir::Res<surface::NodeId>,
+    ) -> Option<Binding> {
+        let binding = Binding { span: source.span(), res };
+        match source {
+            BindingSource::Explicit(_) => {
+                if let Some(prev) = self.non_glob {
+                    Some(prev)
                 } else {
-                    self.opaque = Some(*item_id);
-                    Ok(())
+                    self.non_glob = Some(binding);
+                    None
                 }
             }
-            hir::TyKind::BareFn(_)
-            | hir::TyKind::Never
-            | hir::TyKind::TraitObject(..)
-            | hir::TyKind::Typeof(_)
-            | hir::TyKind::Infer
-            | hir::TyKind::Err(_) => Ok(()),
-        }
-    }
-
-    fn collect_from_generic_args(&mut self, args: &rustc_hir::GenericArgs) -> Result {
-        args.args
-            .iter()
-            .copied()
-            .try_for_each_exhaust(|arg| self.collect_from_generic_arg(&arg))?;
-
-        args.bindings
-            .iter()
-            .copied()
-            .try_for_each_exhaust(|binding| self.collect_from_type_binding(&binding))?;
-        Ok(())
-    }
-
-    fn collect_from_path(&mut self, path: &hir::Path<'_>) -> Result {
-        let key = ResKey::from_hir_path(self.sess, path)?;
-
-        let res = path
-            .res
-            .try_into()
-            .map_or_else(|_| ResEntry::unsupported(*path), ResEntry::Res);
-        self.insert(key, res);
-
-        if let [.., PathSegment { args: Some(args), .. }] = path.segments {
-            self.collect_from_generic_args(args)?;
-        }
-        Ok(())
-    }
-
-    fn collect_from_type_binding(&mut self, binding: &hir::TypeBinding<'_>) -> Result {
-        match binding.kind {
-            hir::TypeBindingKind::Equality { term } => self.collect_from_term(&term),
-            hir::TypeBindingKind::Constraint { bounds } => {
-                bounds
-                    .iter()
-                    .try_for_each_exhaust(|bound| self.collect_from_generic_bound(bound))
+            BindingSource::Glob { .. } => {
+                self.add_glob(binding);
+                None
             }
         }
     }
 
-    fn collect_from_term(&mut self, term: &hir::Term<'_>) -> Result {
-        match term {
-            hir::Term::Ty(ty) => self.collect_from_ty(ty),
-            hir::Term::Const(_) => Ok(()),
-        }
+    /// Fold one more glob candidate into the glob slot. A candidate resolving to the same item as
+    /// the one already recorded (the same item reached through two different globs) is not an
+    /// ambiguity.
+    fn add_glob(&mut self, binding: Binding) {
+        self.glob = Some(match self.glob {
+            None => GlobBinding::Single(binding),
+            Some(GlobBinding::Single(prev)) => {
+                if prev.res == binding.res {
+                    GlobBinding::Single(prev)
+                } else {
+                    GlobBinding::Ambiguous(prev.span, binding.span)
+                }
+            }
+            Some(ambiguous @ GlobBinding::Ambiguous(..)) => ambiguous,
+        });
     }
 
-    fn collect_from_generic_arg(&mut self, arg: &hir::GenericArg) -> Result {
-        match arg {
-            hir::GenericArg::Type(ty) => self.collect_from_ty(ty),
-            hir::GenericArg::Lifetime(_) => Ok(()),
-            hir::GenericArg::Const(_) => {
-                Err(self.sess.emit_err(errors::UnsupportedSignature::new(
-                    arg.span(),
-                    "const generics are not supported yet",
-                )))
+    /// The resolution for `ident`, or `None` if this holds no candidate at all (in which case the
+    /// caller should keep looking in outer scopes).
+    fn resolve(
+        &self,
+        ident: Ident,
+    ) -> Option<std::result::Result<fhir::Res<surface::NodeId>, Ambiguity>> {
+        if let Some(binding) = self.non_glob {
+            return Some(Ok(binding.res));
+        }
+        match self.glob? {
+            GlobBinding::Single(binding) => Some(Ok(binding.res)),
+            GlobBinding::Ambiguous(first, second) => {
+                Some(Err(Ambiguity { span: ident.span, name: ident.name, first, second }))
             }
-
-            hir::GenericArg::Infer(_) => unreachable!(),
         }
     }
 }
 
-impl ResKey {
-    fn from_ident(ident: Ident) -> Self {
-        ResKey { s: format!("{ident}") }
+impl FromIterator<Binding> for NameResolution {
+    /// Fold a stream of *glob* candidates. Used to merge a module's children, where two entries
+    /// for the same name can only come from an ambiguous glob re-export.
+    fn from_iter<T: IntoIterator<Item = Binding>>(iter: T) -> Self {
+        let mut resolution = Self::default();
+        for binding in iter {
+            resolution.add_glob(binding);
+        }
+        resolution
+    }
+}
+
+#[derive(Debug)]
+struct Rib {
+    kind: RibKind,
+    bindings: UnordMap<Symbol, NameResolution>,
+}
+
+impl Rib {
+    fn new(kind: RibKind) -> Self {
+        Self { kind, bindings: Default::default() }
+    }
+}
+
+fn module_children(tcx: TyCtxt<'_>, def_id: DefId) -> &[ModChild] {
+    #[expect(clippy::disallowed_methods, reason = "modules cannot have extern specs")]
+    if let Some(local_id) = def_id.as_local() {
+        tcx.module_children_local(local_id)
+    } else {
+        tcx.module_children(def_id)
+    }
+}
+
+/// Iterator over module children visible form `curr_mod`
+fn visible_module_children(
+    tcx: TyCtxt<'_>,
+    module_id: DefId,
+    curr_mod: DefId,
+) -> impl Iterator<Item = &ModChild> {
+    module_children(tcx, module_id)
+        .iter()
+        .filter(move |child| child.vis.is_accessible_from(curr_mod, tcx))
+}
+
+/// Return true if the item has a `#[prelude_import]` annotation
+fn is_prelude_import(tcx: TyCtxt, item: &hir::Item) -> bool {
+    tcx.hir_attrs(item.hir_id()).iter().any(|attr| {
+        matches!(
+            attr,
+            rustc_attr_ir::Attribute::Parsed(rustc_attr_ir::AttributeKind::PreludeImport)
+        )
+    })
+}
+
+/// Abstraction over a "segment" so we can use [`CrateResolver::resolve_path_with_ribs`] with paths
+/// from different sources  (e.g., [`surface::PathSegment`], [`surface::ExprPathSegment`])
+pub(crate) trait Segment: std::fmt::Debug {
+    fn record_segment_res(
+        resolver: &mut CrateResolver,
+        segment: &Self,
+        res: fhir::Res<surface::NodeId>,
+    );
+    fn ident(&self) -> Ident;
+
+    fn format_iter<'a>(segments: impl IntoIterator<Item = &'a Self>) -> String
+    where
+        Self: Sized + 'a,
+    {
+        segments.into_iter().map(|s| s.ident()).join("::")
+    }
+}
+
+impl Segment for surface::PathSegment {
+    fn record_segment_res(
+        resolver: &mut CrateResolver,
+        segment: &Self,
+        res: fhir::Res<surface::NodeId>,
+    ) {
+        resolver
+            .output
+            .path_res_map
+            .insert(segment.node_id, fhir::PartialRes::new(res));
     }
 
-    fn from_path(path: &Path) -> ResKey {
-        let s = path.segments.iter().join("::");
-        ResKey { s }
+    fn ident(&self) -> Ident {
+        self.ident
+    }
+}
+
+impl Segment for surface::ExprPathSegment {
+    fn record_segment_res(
+        resolver: &mut CrateResolver,
+        segment: &Self,
+        res: fhir::Res<surface::NodeId>,
+    ) {
+        resolver
+            .output
+            .path_res_map
+            .insert(segment.node_id, fhir::PartialRes::new(res));
     }
 
-    fn from_hir_path(sess: &FluxSession, path: &rustc_hir::Path) -> Result<Self> {
-        if let [prefix @ .., _] = path.segments
-            && prefix.iter().any(|segment| segment.args.is_some())
+    fn ident(&self) -> Ident {
+        self.ident
+    }
+}
+
+impl Segment for Ident {
+    fn record_segment_res(
+        _resolver: &mut CrateResolver,
+        _segment: &Self,
+        _res: fhir::Res<surface::NodeId>,
+    ) {
+    }
+
+    fn ident(&self) -> Ident {
+        *self
+    }
+}
+
+impl Segment for hir::PathSegment<'_> {
+    fn record_segment_res(
+        _resolver: &mut CrateResolver,
+        _segment: &Self,
+        _res: fhir::Res<surface::NodeId>,
+    ) {
+    }
+
+    fn ident(&self) -> Ident {
+        self.ident
+    }
+}
+
+struct ItemResolver<'a, 'genv, 'tcx> {
+    resolver: &'a mut CrateResolver<'genv, 'tcx>,
+    errors: Errors<'genv>,
+    item_id: MaybeExternId<OwnerId>,
+}
+
+impl<'a, 'genv, 'tcx> ItemResolver<'a, 'genv, 'tcx> {
+    fn run(
+        resolver: &'a mut CrateResolver<'genv, 'tcx>,
+        item_id: MaybeExternId<OwnerId>,
+        f: impl FnOnce(&mut ItemResolver),
+    ) -> Result {
+        let mut item_resolver = ItemResolver::new(resolver, item_id);
+        f(&mut item_resolver);
+        item_resolver.errors.into_result()
+    }
+
+    fn new(resolver: &'a mut CrateResolver<'genv, 'tcx>, item_id: MaybeExternId<OwnerId>) -> Self {
+        let errors = Errors::new(resolver.genv.sess());
+        Self { resolver, errors, item_id }
+    }
+
+    fn resolve_path_in(&mut self, ns: Namespace, path: &surface::Path) {
+        match self.resolver.resolve_path_with_ribs(&path.segments, ns) {
+            Ok(partial_res) => {
+                self.resolver
+                    .output
+                    .path_res_map
+                    .insert(path.node_id, partial_res);
+            }
+            Err(err) => {
+                err.emit(&self.errors, || {
+                    errors::UnresolvedName::new(path.span, &path.segments, ns.descr())
+                });
+            }
+        }
+    }
+
+    fn resolve_attrs(&mut self, node_id: surface::NodeId, attrs: &[surface::Attr]) {
+        for attr in attrs {
+            match attr {
+                surface::Attr::Qualifiers(names) => self.resolve_qualifiers(node_id, names),
+                surface::Attr::Reveal(names) => {
+                    let reveals = self.resolve_func_defs(names);
+                    self.resolver.output.reveal_res_map.insert(node_id, reveals);
+                }
+                surface::Attr::Hide(names) => {
+                    let hides = self.resolve_func_defs(names);
+                    self.resolver.output.hide_res_map.insert(node_id, hides);
+                }
+                surface::Attr::AssumeParametric(names) => {
+                    self.resolve_parametric_params(node_id, names);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn resolve_parametric_params(&mut self, node_id: surface::NodeId, names: &[Ident]) {
+        let tcx = self.resolver.genv.tcx();
+        let generics = tcx.generics_of(self.item_id.resolved_id());
+        let param_map: UnordMap<Symbol, DefId> = (0..generics.count())
+            .map(|i| generics.param_at(i, tcx))
+            .map(|p| (p.name, p.def_id))
+            .collect();
+        let mut params = Vec::with_capacity(names.len());
+        for name in names {
+            if let Some(&def_id) = param_map.get(&name.name) {
+                params.push(def_id);
+            } else {
+                self.errors
+                    .emit(errors::UnknownParametricParam::new(name.span));
+            }
+        }
+        self.resolver
+            .output
+            .parametric_param_res_map
+            .insert(node_id, params);
+    }
+
+    fn resolve_qualifiers(&mut self, node_id: surface::NodeId, qual_names: &[Ident]) {
+        let mut qualifiers = Vec::with_capacity(qual_names.len());
+        for qual in qual_names {
+            if let Some(def_id) = self.resolver.qualifiers.get(&qual.name) {
+                qualifiers.push(*def_id);
+            } else {
+                self.errors.emit(errors::UnknownQualifier::new(qual.span));
+            }
+        }
+        self.resolver
+            .output
+            .qualifier_res_map
+            .insert(node_id, qualifiers);
+    }
+
+    /// Resolves the names of function definitions in a `#[reveal(...)]` or `#[hide(...)]` attribute
+    fn resolve_func_defs(&mut self, names: &[Ident]) -> Vec<(FluxDefId, Span)> {
+        let mut def_ids = Vec::with_capacity(names.len());
+        for name in names {
+            match self.resolver.resolve_ident_with_ribs(*name, ReftNS) {
+                Ok(fhir::Res::GlobalFunc(kind)) => {
+                    if let Some(def_id) = kind.def_id() {
+                        def_ids.push((def_id, name.span));
+                    } else {
+                        self.errors
+                            .emit(errors::UnknownFuncDefinition::new(name.span));
+                    }
+                }
+                Ok(_) => {
+                    self.errors
+                        .emit(errors::UnknownFuncDefinition::new(name.span));
+                }
+                Err(err) => {
+                    err.emit(&self.errors, || errors::UnknownFuncDefinition::new(name.span));
+                }
+            }
+        }
+        def_ids
+    }
+}
+
+impl surface::visit::Visitor<'_> for ItemResolver<'_, '_, '_> {
+    fn visit_item(&mut self, item: &surface::Item) {
+        self.resolve_attrs(item.node_id, &item.attrs);
+        surface::visit::walk_item(self, item);
+    }
+
+    fn visit_trait_item(&mut self, item: &surface::TraitItemFn) {
+        self.resolve_attrs(item.node_id, &item.attrs);
+        surface::visit::walk_trait_item(self, item);
+    }
+
+    fn visit_impl_item(&mut self, item: &surface::ImplItemFn) {
+        self.resolve_attrs(item.node_id, &item.attrs);
+        surface::visit::walk_impl_item(self, item);
+    }
+
+    fn visit_trait(&mut self, trait_: &surface::Trait) {
+        let mut definitions = DefinitionMap::default();
+        for assoc_reft in &trait_.assoc_refinements {
+            let _ = definitions.define(assoc_reft.name).emit(&self.errors);
+        }
+        surface::visit::walk_trait(self, trait_);
+    }
+
+    fn visit_impl(&mut self, impl_: &surface::Impl) {
+        let mut definitions = DefinitionMap::default();
+        for assoc_reft in &impl_.assoc_refinements {
+            let _ = definitions.define(assoc_reft.name).emit(&self.errors);
+        }
+        surface::visit::walk_impl(self, impl_);
+    }
+
+    fn visit_generic_arg(&mut self, arg: &surface::GenericArg) {
+        if let surface::GenericArgKind::Type(ty) = &arg.kind
+            && let Some(path) = ty.is_potential_const_arg()
         {
-            return Err(sess.emit_err(errors::UnsupportedSignature::new(
-                path.span,
-                "path segments with generic arguments are not supported",
-            )));
+            // We parse const arguments as path types as we cannot distinguish them during
+            // parsing. We try to resolve that ambiguity by attempting resolution in both the
+            // type and value namespaces. If we resolved the path in the value namespace, we
+            // transform it into a generic const argument.
+            // A name that is *ambiguous* in a namespace, or that is a forbidden outer generic,
+            // still counts as present there: rerouting to the other namespace would hide the error
+            // instead of reporting it. The real diagnostic comes from `resolve_path_in` below.
+            let check_ns = |ns| {
+                !matches!(
+                    self.resolver.resolve_ident_with_ribs(path.last().ident, ns),
+                    Err(ResolveError::NotFound)
+                )
+            };
+
+            if !check_ns(TypeNS) && check_ns(ValueNS) {
+                self.resolve_path_in(ValueNS, path);
+                return;
+            }
         }
-        let s = path.segments.iter().map(|segment| segment.ident).join("::");
-        Ok(ResKey { s })
+        surface::visit::walk_generic_arg(self, arg);
+    }
+
+    fn visit_const_arg(&mut self, const_arg: &surface::ConstArg) {
+        if let surface::ConstArgKind::Path(path) = &const_arg.kind {
+            self.resolve_path_in(ValueNS, path);
+            surface::visit::walk_path(self, path);
+        }
+    }
+
+    fn visit_path(&mut self, path: &surface::Path) {
+        self.resolve_path_in(TypeNS, path);
+        surface::visit::walk_path(self, path);
     }
 }
 
-impl From<Res> for ResEntry {
-    fn from(res: Res) -> Self {
-        ResEntry::Res(res)
-    }
+/// The [`Namespace::TypeNS`] prelude: builtin Rust types (`bool`, `i32`, `str`, ...) together with
+/// the sort-only primitive sorts (`int`, `real`, `Set`, `Map`, `ptr`). Sorts and types share the
+/// type namespace; `bool`/`char`/`str` are resolved as [`fhir::Res::PrimTy`] and their sort is
+/// derived in `conv_sort_path` (see [`fhir::PrimSort`]).
+fn builtin_types_rib() -> Rib {
+    use flux_middle::fhir::PrimSort;
+    let sorts = PrimSort::ALL.into_iter().map(|prim| {
+        let ident = Ident::with_dummy_span(prim.name());
+        (
+            ident.name,
+            NameResolution::from_explicit(Binding {
+                span: ident.span,
+                res: fhir::Res::PrimSort(prim),
+            }),
+        )
+    });
+    let types = PrimTy::ALL.into_iter().map(|pty| {
+        let ident = Ident::with_dummy_span(pty.name());
+        (
+            ident.name,
+            NameResolution::from_explicit(Binding {
+                span: ident.span,
+                res: fhir::Res::PrimTy(pty),
+            }),
+        )
+    });
+
+    // Types go after such that they override sorts with the same name. Note this collects into a
+    // map, so it is a plain last-one-wins overwrite, not the shadowing/ambiguity fold used for
+    // user-written definitions.
+    let bindings = sorts.chain(types).collect();
+    Rib { kind: RibKind::Misc, bindings }
 }
 
-impl ResEntry {
-    fn unsupported(path: hir::Path) -> Self {
-        Self::Unsupported { span: path.span, reason: format!("unsupported res `{:?}`", path.res) }
+/// The [`Namespace::ReftNS`] prelude: theory functions and `cast`.
+fn theory_funcs_rib() -> Rib {
+    let mut rib = Rib::new(RibKind::Misc);
+    rib.bindings
+        .extend_unord(flux_middle::THEORY_FUNCS.items().map(|(_, itf)| {
+            let ident = Ident::with_dummy_span(itf.name);
+            let res = fhir::Res::GlobalFunc(fhir::SpecFuncKind::Thy(itf.itf));
+            (ident.name, NameResolution::from_explicit(Binding { span: ident.span, res }))
+        }));
+    let cast_ident = Ident::with_dummy_span(sym::cast);
+    rib.bindings.insert(
+        cast_ident.name,
+        NameResolution::from_explicit(Binding {
+            span: cast_ident.span,
+            res: fhir::Res::GlobalFunc(fhir::SpecFuncKind::Cast),
+        }),
+    );
+    rib
+}
+
+fn mk_crate_mapping(tcx: TyCtxt) -> UnordMap<Symbol, DefId> {
+    let mut map = UnordMap::default();
+    for cnum in tcx.crates(()) {
+        let name = tcx.crate_name(*cnum);
+        if let Some(extern_crate) = tcx.extern_crate(*cnum)
+            && extern_crate.is_direct()
+        {
+            map.insert(name, cnum.as_def_id());
+        }
     }
+    map
 }
 
 mod errors {
+    use flux_errors::E0999;
     use flux_macros::Diagnostic;
-    use flux_syntax::surface;
-    use itertools::Itertools;
-    use rustc_span::Span;
+    use flux_syntax::surface::Ident;
+    use rustc_span::{Span, Symbol, def_id::DefId};
+
+    use super::Segment;
+
+    /// A name that could not be resolved. `kind` is the user-facing description of what was being
+    /// looked for (`"type"`, `"value"`, `"sort"`, ...); it is passed explicitly by each call site
+    /// because it no longer matches the resolution [`Namespace`](flux_middle::fhir::Namespace)
+    /// (e.g. sorts are resolved in the type namespace).
+    #[derive(Diagnostic)]
+    #[diag("cannot find {$kind} `{$name}` in this scope", code = E0999)]
+    pub(crate) struct UnresolvedName {
+        #[primary_span]
+        #[label("not found in this scope")]
+        span: Span,
+        kind: &'static str,
+        name: String,
+    }
+
+    impl UnresolvedName {
+        pub(crate) fn new<S: Segment>(span: Span, segments: &[S], kind: &'static str) -> Self {
+            Self { span, name: Segment::format_iter(segments), kind }
+        }
+    }
+
+    /// An import path (`flux::use foo::bar::baz`) that could not be resolved. Unlike
+    /// [`UnresolvedName`], this always reports the full requested path in the message and
+    /// explains, via `reason`, what specifically went wrong at the failing segment (not found,
+    /// or found but not a module).
+    #[derive(Diagnostic)]
+    #[diag("unresolved import `{$name}`", code = E0999)]
+    pub(crate) struct UnresolvedImport {
+        #[primary_span]
+        #[label("{$reason}")]
+        pub span: Span,
+        pub name: String,
+        pub reason: String,
+    }
+
+    impl UnresolvedImport {
+        /// The import segment `ident` was not found, in `module_id` if the prefix before it
+        /// resolved to one, or in scope otherwise.
+        pub(super) fn new(
+            ident: Ident,
+            module_id: Option<DefId>,
+            resolved_prefix: &[Ident],
+        ) -> Self {
+            let reason = match module_id {
+                None => "not found in this scope".to_string(),
+                Some(_) => format!("no `{ident}` in `{}`", Segment::format_iter(resolved_prefix)),
+            };
+            let name = Segment::format_iter(resolved_prefix.iter().chain(&[ident]));
+            Self { span: ident.span, name, reason }
+        }
+    }
 
     #[derive(Diagnostic)]
-    #[diag(desugar_unsupported_signature, code = "FLUX")]
-    #[note]
-    pub(super) struct UnsupportedSignature<'a> {
+    #[diag("can't use generic parameters from outer item", code = E0999)]
+    #[note("nested items cannot mention the generic parameters or `Self` of outer items")]
+    pub(super) struct OuterGeneric {
+        #[primary_span]
+        #[label("use of generic parameter from outer item")]
+        pub span: Span,
+    }
+
+    #[derive(Diagnostic)]
+    #[diag("unknown qualifier", code = E0999)]
+    pub(super) struct UnknownQualifier {
         #[primary_span]
         span: Span,
-        note: &'a str,
     }
 
-    impl<'a> UnsupportedSignature<'a> {
-        pub(super) fn new(span: Span, note: &'a str) -> Self {
-            Self { span, note }
+    impl UnknownQualifier {
+        pub(super) fn new(span: Span) -> Self {
+            Self { span }
         }
     }
 
     #[derive(Diagnostic)]
-    #[diag(desugar_unresolved_path, code = "FLUX")]
-    #[help]
-    pub struct UnresolvedPath {
+    #[diag("unknown function definition", code = E0999)]
+    pub(super) struct UnknownFuncDefinition {
         #[primary_span]
-        pub span: Span,
-        pub path: String,
+        span: Span,
     }
 
-    impl UnresolvedPath {
-        pub fn new(path: &surface::Path) -> Self {
-            Self { span: path.span, path: path.segments.iter().join("::") }
+    impl UnknownFuncDefinition {
+        pub(super) fn new(span: Span) -> Self {
+            Self { span }
         }
+    }
+
+    #[derive(Diagnostic)]
+    #[diag("unknown type parameter", code = E0999)]
+    pub(super) struct UnknownParametricParam {
+        #[primary_span]
+        span: Span,
+    }
+
+    impl UnknownParametricParam {
+        pub(super) fn new(span: Span) -> Self {
+            Self { span }
+        }
+    }
+
+    #[derive(Diagnostic)]
+    #[diag("the name `{$name}` is defined multiple times", code = E0999)]
+    pub(super) struct DuplicateDefinition {
+        #[primary_span]
+        #[label("`{$name}` redefined here")]
+        pub span: Span,
+        #[label("previous definition of `{$name}`")]
+        pub previous_definition: Span,
+        pub name: Symbol,
+    }
+
+    /// A name bound to two different items by two competing glob imports, reported at the first
+    /// use of the name (imports themselves are never an error). Mirrors rustc's `E0659`.
+    #[derive(Diagnostic)]
+    #[diag("the name `{$name}` is ambiguous", code = E0999)]
+    #[note("two different items named `{$name}` are in scope through glob imports")]
+    pub(super) struct AmbiguousName {
+        #[primary_span]
+        #[label("ambiguous name")]
+        span: Span,
+        name: Symbol,
+        #[label("`{$name}` could refer to the item imported here")]
+        first: Span,
+        #[label("`{$name}` could also refer to the item imported here")]
+        second: Option<Span>,
+    }
+
+    impl AmbiguousName {
+        pub(super) fn new(ambiguity: super::Ambiguity) -> Self {
+            let super::Ambiguity { span, name, first, second } = ambiguity;
+            // Both candidates can come from the same glob statement, when it imports a module
+            // that is itself ambiguously glob re-exporting the name. Pointing a second, identical
+            // label at it reads as a bug, so drop it.
+            Self { span, name, first, second: (first != second).then_some(second) }
+        }
+    }
+
+    #[derive(Diagnostic)]
+    #[diag("identifier `{$name}` is bound more than once in this parameter list", code = E0999)]
+    pub(super) struct DuplicateParam {
+        #[primary_span]
+        #[label("used as a parameter more than once")]
+        pub span: Span,
+        pub name: Symbol,
+        #[label("first use of `{$name}`")]
+        pub first_use: Span,
     }
 }

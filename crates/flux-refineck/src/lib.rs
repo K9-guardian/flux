@@ -1,184 +1,416 @@
 //! Refinement type checking
 
-#![feature(
-    associated_type_defaults,
-    box_patterns,
-    extract_if,
-    if_let_guard,
-    impl_trait_in_assoc_type,
-    lazy_cell,
-    let_chains,
-    min_specialization,
-    never_type,
-    result_option_inspect,
-    rustc_private,
-    type_alias_impl_trait,
-    unwrap_infallible
-)]
+#![feature(associated_type_defaults, deref_patterns, min_specialization, rustc_private)]
 
+extern crate rustc_abi;
+extern crate rustc_attr_ir;
 extern crate rustc_data_structures;
 extern crate rustc_errors;
-extern crate rustc_hash;
 extern crate rustc_hir;
 extern crate rustc_index;
 extern crate rustc_infer;
 extern crate rustc_middle;
 extern crate rustc_mir_dataflow;
-extern crate rustc_serialize;
 extern crate rustc_span;
 extern crate rustc_type_ir;
 
 mod checker;
-mod constraint_gen;
-mod fixpoint_encoding;
+pub mod compare_impl_item;
 mod ghost_statements;
 pub mod invariants;
+mod primops;
 mod queue;
-mod refine_tree;
-mod sigs;
 mod type_env;
 
-use checker::Checker;
-pub use checker::CheckerConfig;
-use constraint_gen::{ConstrReason, Tag};
-use flux_common::{cache::QueryCache, dbg};
+use checker::{Checker, trait_impl_subtyping};
+use flux_common::{dbg, dbg::SpanTrace, result::ResultExt as _};
 use flux_config as config;
-use flux_errors::ResultExt;
-use flux_macros::fluent_messages;
-use flux_middle::{
-    global_env::GlobalEnv,
-    rty::{self, ESpan},
+use flux_infer::{
+    fixpoint_encoding::{
+        FixQueryCache, FixpointCheckError, PossibleSolutions, SolutionTrace, TagIdx,
+    },
+    infer::{ConstrReason, SubtypeReason, Tag},
+    wkvars::WKVarSubst,
 };
-use itertools::Itertools;
-use rustc_errors::{DiagnosticMessage, ErrorGuaranteed, SubdiagnosticMessage};
-use rustc_hir::def_id::LocalDefId;
+use flux_macros::msg;
+use flux_middle::{
+    FixpointQueryKind,
+    def_id::MaybeExternId,
+    global_env::GlobalEnv,
+    metrics::{self, Metric, TimingKind},
+    pretty,
+    rty::{self, ESpan, EarlyBinder, fold::TypeFoldable},
+};
+use rustc_data_structures::{fx::FxHashMap, unord::UnordMap};
+use rustc_errors::{Applicability, Diag, ErrorGuaranteed};
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_span::Span;
 
-use crate::ghost_statements::compute_ghost_statements;
+use crate::{checker::errors::ResultExt as _, ghost_statements::compute_ghost_statements};
 
-fluent_messages! { "../locales/en-US.ftl" }
+pub fn report_fixpoint_errors(
+    genv: GlobalEnv,
+    local_id: LocalDefId,
+    errors: Vec<FixpointCheckError<Tag>>,
+) -> Result<(), ErrorGuaranteed> {
+    #[expect(clippy::collapsible_else_if, reason = "it looks better")]
+    if genv.should_fail(local_id) {
+        if errors.is_empty() { report_expected_neg(genv, local_id) } else { Ok(()) }
+    } else {
+        if errors.is_empty() { Ok(()) } else { report_errors(genv, local_id, errors) }
+    }
+}
+
+fn check_body(
+    genv: GlobalEnv,
+    cache: &mut FixQueryCache,
+    def_id: LocalDefId,
+    poly_sig: &rty::PolyFnSig,
+) -> Result<(), ErrorGuaranteed> {
+    let span = genv.tcx().def_span(def_id);
+    let opts = genv.infer_opts(def_id);
+
+    dbg::log_verbose!("FLUX checking: {def_id:?} {span:?}");
+
+    let ghost_stmts = compute_ghost_statements(genv, def_id)
+        .with_span(span)
+        .map_err(|err| err.emit(genv, def_id))?;
+    let mut closures = UnordMap::default();
+
+    // PHASE 1: infer shape of `TypeEnv` at the entry of join points
+    let shape_result =
+        Checker::run_in_shape_mode(genv, def_id, &ghost_stmts, &mut closures, opts, poly_sig)
+            .map_err(|err| err.emit(genv, def_id))?;
+
+    // PHASE 2: generate refinement tree constraint
+    let infcx_root = Checker::run_in_refine_mode(
+        genv,
+        def_id,
+        &ghost_stmts,
+        &mut closures,
+        shape_result,
+        opts,
+        poly_sig,
+    )
+    .map_err(|err| err.emit(genv, def_id))?;
+
+    // PHASE 3: invoke fixpoint on the constraint
+    if (genv.proven_externally(def_id).is_some() && flux_config::lean().is_check())
+        || flux_config::lean().is_emit()
+    {
+        infcx_root
+            .execute_lean_query(cache, MaybeExternId::Local(def_id))
+            .emit(&genv)
+    } else {
+        let answer = infcx_root
+            .execute_fixpoint_query(cache, MaybeExternId::Local(def_id), FixpointQueryKind::Body)
+            .emit(&genv)?;
+
+        let tcx = genv.tcx();
+        let hir_id = tcx.local_def_id_to_hir_id(def_id);
+        let body_span = tcx.hir_span_with_body(hir_id);
+        dbg::solution!(genv, &answer, body_span);
+
+        let errors = answer.errors;
+        report_fixpoint_errors(genv, def_id, errors)
+    }
+}
+
+pub fn check_static(
+    genv: GlobalEnv,
+    cache: &mut FixQueryCache,
+    def_id: LocalDefId,
+    ty: rty::Ty,
+) -> Result<(), ErrorGuaranteed> {
+    // Build a PolyFnSig with no inputs and `ty` as the output
+    let output = rty::Binder::dummy(rty::FnOutput::new(ty, vec![]));
+    let fn_sig = rty::FnSig::new(
+        rustc_hir::Safety::Safe,
+        rustc_abi::ExternAbi::Rust,
+        rty::List::empty(),
+        rty::List::empty(),
+        output,
+        rty::Expr::ff(),
+        false,
+    );
+    let poly_sig = rty::PolyFnSig::dummy(fn_sig);
+
+    metrics::incr_metric(Metric::FnChecked, 1);
+    metrics::time_it(TimingKind::CheckBody(def_id), || check_body(genv, cache, def_id, &poly_sig))
+}
 
 pub fn check_fn(
-    genv: &GlobalEnv,
-    cache: &mut QueryCache,
+    genv: GlobalEnv,
+    cache: &mut FixQueryCache,
     def_id: LocalDefId,
-    config: CheckerConfig,
 ) -> Result<(), ErrorGuaranteed> {
-    dbg::check_fn_span!(genv.tcx, def_id).in_scope(|| {
-        if genv.map().is_trusted(def_id) {
-            return Ok(());
-        }
+    let span = genv.tcx().def_span(def_id);
 
-        // HACK(nilehmann) this will ignore any code generated by a macro. This is
-        // a temporary workaround to allow `#[derive(PartialEq, Eq)]` and should be
-        // removed.
-        if genv.tcx.def_span(def_id).ctxt() > rustc_span::SyntaxContext::root() {
-            return Ok(());
-        }
-        let ghost_stmts = compute_ghost_statements(genv, def_id).emit(genv.sess)?;
-
-        // PHASE 1: infer shape of `TypeEnv` at the entry of join points
-        let shape_result =
-            Checker::run_in_shape_mode(genv, def_id, &ghost_stmts, config).emit(genv.sess)?;
-        tracing::info!("check_fn::shape");
-
-        // PHASE 2: generate refinement tree constraint
-        let (mut refine_tree, kvars) =
-            Checker::run_in_refine_mode(genv, def_id, &ghost_stmts, shape_result, config)
-                .emit(genv.sess)?;
-        tracing::info!("check_fn::refine");
-
-        // PHASE 3: invoke fixpoint on the constraint
-        refine_tree.simplify();
-        if config::dump_constraint() {
-            dbg::dump_item_info(genv.tcx, def_id, "fluxc", &refine_tree).unwrap();
-        }
-        let mut fcx = fixpoint_encoding::FixpointCtxt::new(genv, def_id, kvars);
-        fcx.collect_sorts(&refine_tree);
-        let constraint = refine_tree.into_fixpoint(&mut fcx);
-        let errors = fcx.check(cache, constraint, &config).emit(genv.sess)?;
-
-        tracing::info!("check_fn::fixpoint");
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            report_errors(genv, errors)
-        }
-    })
-}
-
-fn call_error(genv: &GlobalEnv, span: Span, dst_span: Option<ESpan>) -> ErrorGuaranteed {
-    genv.sess
-        .emit_err(errors::RefineError::call(span, dst_span))
-}
-
-fn ret_error(genv: &GlobalEnv, span: Span, dst_span: Option<ESpan>) -> ErrorGuaranteed {
-    genv.sess.emit_err(errors::RefineError::ret(span, dst_span))
-}
-
-fn report_errors(genv: &GlobalEnv, errors: Vec<Tag>) -> Result<(), ErrorGuaranteed> {
-    let mut e = None;
-    for err in errors {
-        let span = err.src_span;
-        e = Some(match err.reason {
-            ConstrReason::Call => call_error(genv, span, err.dst_span),
-            ConstrReason::Assign => genv.sess.emit_err(errors::AssignError { span }),
-            ConstrReason::Ret => ret_error(genv, span, err.dst_span),
-            ConstrReason::Div => genv.sess.emit_err(errors::DivError { span }),
-            ConstrReason::Rem => genv.sess.emit_err(errors::RemError { span }),
-            ConstrReason::Goto(_) => genv.sess.emit_err(errors::GotoError { span }),
-            ConstrReason::Assert(msg) => genv.sess.emit_err(errors::AssertError { span, msg }),
-            ConstrReason::Fold => genv.sess.emit_err(errors::FoldError { span }),
-            ConstrReason::Overflow => genv.sess.emit_err(errors::OverflowError { span }),
-            ConstrReason::Other => genv.sess.emit_err(errors::UnknownError { span }),
-        });
+    // Code generated by a `#[derive(..)]` can't be annotated with `#[trusted]` directly, so a
+    // type opts its derived code out of checking with `#[flux::trusted_derive]`. This is needed
+    // for types whose derives flux cannot handle, e.g. a `#[flux::opaque]` struct whose derived
+    // `Debug`/`Hash` read the internal representation.
+    if span.in_derive_expansion()
+        && let Some(adt_def_id) = genv.derive_self_ty(def_id)
+        && genv.trusted_derive(adt_def_id)
+    {
+        metrics::incr_metric(Metric::FnTrusted, 1);
+        return Ok(());
     }
 
-    if let Some(e) = e {
-        Err(e)
+    let opts = genv.infer_opts(def_id);
+
+    // FIXME(nilehmann) we should move this check to `compare_impl_item`
+    if let Some(infcx_root) = trait_impl_subtyping(genv, def_id, opts, span)
+        .with_span(span)
+        .map_err(|err| err.emit(genv, def_id))?
+    {
+        tracing::info!("check_fn::refine-subtyping");
+        let answer = infcx_root
+            .execute_fixpoint_query(cache, MaybeExternId::Local(def_id), FixpointQueryKind::Impl)
+            .emit(&genv)?;
+        tracing::info!("check_fn::fixpoint-subtyping");
+        let errors = answer.errors;
+        report_fixpoint_errors(genv, def_id, errors)?;
+    }
+
+    // Skip trusted functions
+    if genv.trusted(def_id) {
+        metrics::incr_metric(Metric::FnTrusted, 1);
+        return Ok(());
+    }
+
+    metrics::incr_metric(Metric::FnChecked, 1);
+    metrics::time_it(TimingKind::CheckBody(def_id), || -> Result<(), ErrorGuaranteed> {
+        let poly_sig = genv
+            .fn_sig(def_id)
+            .with_span(span)
+            .map_err(|err| err.emit(genv, def_id))?
+            .instantiate_identity();
+        let poly_sig = rty::auto_strong(genv, def_id, poly_sig);
+
+        check_body(genv, cache, def_id, &poly_sig)
+    })?;
+
+    dbg::check_fn_span!(genv.tcx(), def_id).in_scope(|| Ok(()))
+}
+
+fn call_error<'a>(genv: GlobalEnv<'a, '_>, span: Span, dst_span: Option<ESpan>) -> Diag<'a> {
+    genv.sess()
+        .dcx()
+        .create_err(errors::RefineError::call(span, dst_span))
+}
+
+fn ret_error<'a>(genv: GlobalEnv<'a, '_>, span: Span, dst_span: Option<ESpan>) -> Diag<'a> {
+    genv.sess()
+        .dcx()
+        .create_err(errors::RefineError::ret(span, dst_span))
+}
+
+fn report_errors(
+    genv: GlobalEnv,
+    local_id: LocalDefId,
+    errors: Vec<FixpointCheckError<Tag>>,
+) -> Result<(), ErrorGuaranteed> {
+    let log_path = if config::dump_constraint() {
+        let path = dbg::item_dump_path(genv.tcx(), local_id.to_def_id(), "smt2");
+        if path.exists() { Some(path) } else { None }
     } else {
-        Ok(())
+        None
+    };
+    let mut solutions_by_tag: FxHashMap<Tag, (TagIdx, PossibleSolutions)> = FxHashMap::default();
+    for error in errors {
+        if let Some((_, val)) = solutions_by_tag.get_mut(&error.tag) {
+            val.extend(error.possible_solutions);
+        } else {
+            solutions_by_tag.insert(error.tag, (error.tag_idx, error.possible_solutions));
+        }
     }
+    let rerun_note = rerun_hint_note(genv, local_id);
+    let mut e = None;
+    for (tag, (tag_idx, possible_solutions)) in solutions_by_tag {
+        let span = tag.src_span;
+        let mut err_diag = match tag.reason {
+            ConstrReason::Call
+            | ConstrReason::Subtype(SubtypeReason::Input)
+            | ConstrReason::Subtype(SubtypeReason::Requires)
+            | ConstrReason::Predicate => call_error(genv, span, tag.dst_span),
+            ConstrReason::Assign => genv.sess().dcx().create_err(errors::AssignError { span }),
+            ConstrReason::Ret
+            | ConstrReason::Subtype(SubtypeReason::Output)
+            | ConstrReason::Subtype(SubtypeReason::Ensures) => ret_error(genv, span, tag.dst_span),
+            ConstrReason::Div => genv.sess().dcx().create_err(errors::DivError { span }),
+            ConstrReason::Rem => genv.sess().dcx().create_err(errors::RemError { span }),
+            ConstrReason::Goto(_) => genv.sess().dcx().create_err(errors::GotoError { span }),
+            ConstrReason::Assert(msg) => {
+                genv.sess()
+                    .dcx()
+                    .create_err(errors::AssertError { span, msg })
+            }
+            ConstrReason::Fold | ConstrReason::FoldLocal => {
+                genv.sess()
+                    .dcx()
+                    .create_err(errors::FoldError::new(span, tag.dst_span))
+            }
+            ConstrReason::Overflow => genv.sess().dcx().create_err(errors::OverflowError { span }),
+            ConstrReason::Underflow => {
+                genv.sess()
+                    .dcx()
+                    .create_err(errors::UnderflowError { span })
+            }
+            ConstrReason::Other => genv.sess().dcx().create_err(errors::UnknownError { span }),
+            ConstrReason::NoPanic(callee, reason) => {
+                genv.sess().dcx().create_err(errors::PanicError {
+                    span,
+                    callee: genv.tcx().def_path_debug_str(callee),
+                    reason: format!("{:?}", reason),
+                })
+            }
+        };
+        let wkvar_solutions = possible_solutions
+            .iter()
+            .flat_map(|(wkvid, solutions)| solutions.iter().map(move |solution| (wkvid, solution)));
+        for (wkvid, solution) in wkvar_solutions {
+            add_fn_fix_diagnostic(genv, &mut err_diag, wkvid.clone(), solution);
+        }
+        if let Some(note) = &rerun_note {
+            err_diag.note(note.clone());
+        }
+        if let Some(path) = &log_path {
+            err_diag.arg("path", path.display().to_string());
+            err_diag.arg("tag", tag_idx.to_string());
+            err_diag.note(msg!("log file saved to {$path} (tag: {$tag})"));
+        }
+        e = Some(err_diag.emit_err());
+    }
+
+    if let Some(e) = e { Err(e) } else { Ok(()) }
+}
+
+fn report_expected_neg(genv: GlobalEnv, def_id: LocalDefId) -> Result<(), ErrorGuaranteed> {
+    Err(genv.sess().emit_err(errors::ExpectedNeg {
+        span: genv.tcx().def_span(def_id),
+        def_descr: genv.tcx().def_descr(def_id.to_def_id()),
+    }))
+}
+
+fn add_fn_fix_diagnostic<'a>(
+    genv: GlobalEnv<'a, '_>,
+    diag: &mut Diag<'a>,
+    wkvid: rty::WKVid,
+    solution: &rty::Binder<rty::Expr>,
+) {
+    let pretty_solution = solution.map_ref(|e| e.simplify(&Default::default()).prettify());
+    let fn_sig = genv.fn_sig(wkvid.parent_fn).unwrap();
+    let mut wkvar_subst = WKVarSubst::new(
+        std::iter::once((wkvid.clone(), pretty_solution)).collect::<UnordMap<_, _>>(),
+        false,
+    );
+    let solved_fn_sig = EarlyBinder(fn_sig.skip_binder_ref().fold_with(&mut wkvar_subst));
+    let fixed_fn_sig_snippet = format!(
+        "{:?}",
+        pretty::with_cx!(&pretty::PrettyCx::default(genv).hide_regions(true), &solved_fn_sig)
+    );
+    let fn_first_line = fn_first_line(genv, wkvid.parent_fn);
+    let fn_first_line_snippet = genv
+        .tcx()
+        .sess
+        .source_map()
+        .span_to_snippet(fn_first_line)
+        .unwrap_or_else(|_| panic!("No snippet for span {:?}", fn_first_line));
+    let prefix_spaces = &fn_first_line_snippet[..fn_first_line_snippet
+        .find(|c: char| !c.is_whitespace())
+        .unwrap_or(fn_first_line_snippet.len())];
+    let subst_solutions = &wkvar_subst.subst_instantiations[&wkvid];
+    assert!(subst_solutions.len() == 1);
+
+    // Check if there's an existing spec attribute that needs to be replaced
+    if let Some(old_spec_span) = genv.spec_attr_span(wkvid.parent_fn) {
+        diag.span_suggestion(
+            old_spec_span,
+            "try replacing the refinement",
+            format!("{}#[flux_rs::sig({})]", prefix_spaces, fixed_fn_sig_snippet),
+            Applicability::MachineApplicable,
+        );
+    } else {
+        diag.span_suggestion(
+            fn_first_line,
+            "try adding the refinement",
+            format!(
+                "{}#[flux_rs::sig({})]\n{}",
+                prefix_spaces, fixed_fn_sig_snippet, fn_first_line_snippet
+            ),
+            Applicability::MachineApplicable,
+        );
+    }
+}
+
+fn fn_first_line<'a>(genv: GlobalEnv<'a, '_>, def_id: DefId) -> Span {
+    let span = genv.tcx().def_span(def_id);
+    let first_line = genv
+        .tcx()
+        .sess
+        .source_map()
+        .lookup_line(span.lo())
+        .unwrap_or_else(|_| panic!("span for {:?} doesn't have a first line", def_id));
+    let first_line_range = first_line.sf.line_bounds(first_line.line);
+    Span::new(first_line_range.start, first_line_range.end, span.ctxt(), None)
+}
+
+fn rerun_hint_note(genv: GlobalEnv, def_id: LocalDefId) -> Option<String> {
+    if !config::rerun_hint() || !config::inside_cargo() {
+        return None;
+    }
+    let pattern = format!("def:{}", genv.tcx().def_path_str(def_id));
+    let pkg = std::env::var("CARGO_PKG_NAME")
+        .map(|p| format!(" -p {p}"))
+        .unwrap_or_default();
+    Some(format!("to rerun: `cargo flux check{pkg} --only-check={}`", shell_quote_arg(&pattern)))
+}
+
+fn shell_quote_arg(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 mod errors {
+    use flux_errors::E0999;
     use flux_macros::{Diagnostic, Subdiagnostic};
     use flux_middle::rty::ESpan;
     use rustc_span::Span;
 
     #[derive(Diagnostic)]
-    #[diag(refineck_goto_error, code = "FLUX")]
+    #[diag("error jumping to join point", code = E0999)]
     pub struct GotoError {
         #[primary_span]
         pub span: Span,
     }
 
     #[derive(Diagnostic)]
-    #[diag(refineck_assign_error, code = "FLUX")]
+    #[diag("assignment might be unsafe", code = E0999)]
     pub struct AssignError {
         #[primary_span]
         pub span: Span,
     }
 
     #[derive(Subdiagnostic)]
-    #[note(refineck_condition_span_note)]
+    #[note("this is the condition that cannot be proved")]
     pub(crate) struct ConditionSpanNote {
         #[primary_span]
         pub span: Span,
     }
 
     #[derive(Subdiagnostic)]
-    #[note(refineck_call_span_note)]
+    #[note("inside this call")]
     pub(crate) struct CallSpanNote {
         #[primary_span]
         pub span: Span,
     }
 
     #[derive(Diagnostic)]
-    #[diag(refineck_refine_error, code = "FLUX")]
+    #[diag("refinement type error", code = E0999)]
     pub struct RefineError {
         #[primary_span]
-        #[label]
+        #[label("a {$cond} cannot be proved")]
         pub span: Span,
         cond: &'static str,
         #[subdiagnostic]
@@ -199,8 +431,8 @@ mod errors {
         fn new(cond: &'static str, span: Span, espan: Option<ESpan>) -> RefineError {
             match espan {
                 Some(dst_span) => {
-                    let span_note = Some(ConditionSpanNote { span: dst_span.span() });
-                    let call_span_note = dst_span.base().map(|span| CallSpanNote { span });
+                    let span_note = Some(ConditionSpanNote { span: dst_span.span });
+                    let call_span_note = dst_span.base.map(|span| CallSpanNote { span });
                     RefineError { span, cond, span_note, call_span_note }
                 }
                 None => RefineError { span, cond, span_note: None, call_span_note: None },
@@ -209,21 +441,21 @@ mod errors {
     }
 
     #[derive(Diagnostic)]
-    #[diag(refineck_div_error, code = "FLUX")]
+    #[diag("possible division by zero", code = E0999)]
     pub struct DivError {
         #[primary_span]
         pub span: Span,
     }
 
     #[derive(Diagnostic)]
-    #[diag(refineck_rem_error, code = "FLUX")]
+    #[diag("possible remainder with a divisor of zero", code = E0999)]
     pub struct RemError {
         #[primary_span]
         pub span: Span,
     }
 
     #[derive(Diagnostic)]
-    #[diag(refineck_assert_error, code = "FLUX")]
+    #[diag("assertion might fail: {$msg}", code = E0999)]
     pub struct AssertError {
         #[primary_span]
         pub span: Span,
@@ -231,23 +463,56 @@ mod errors {
     }
 
     #[derive(Diagnostic)]
-    #[diag(refineck_fold_error, code = "FLUX")]
+    #[diag("type invariant may not hold (when place is folded)", code = E0999)]
     pub struct FoldError {
         #[primary_span]
         pub span: Span,
+        #[subdiagnostic]
+        span_note: Option<ConditionSpanNote>,
+    }
+
+    impl FoldError {
+        pub fn new(span: Span, espan: Option<ESpan>) -> Self {
+            let span_note = espan.map(|espan| ConditionSpanNote { span: espan.span });
+            FoldError { span, span_note }
+        }
     }
 
     #[derive(Diagnostic)]
-    #[diag(refineck_overflow_error, code = "FLUX")]
+    #[diag("arithmetic operation may overflow", code = E0999)]
     pub struct OverflowError {
         #[primary_span]
         pub span: Span,
     }
 
     #[derive(Diagnostic)]
-    #[diag(refineck_unknown_error, code = "FLUX")]
+    #[diag("arithmetic operation may underflow", code = E0999)]
+    pub struct UnderflowError {
+        #[primary_span]
+        pub span: Span,
+    }
+
+    #[derive(Diagnostic)]
+    #[diag("cannot prove this code safe", code = E0999)]
     pub struct UnknownError {
         #[primary_span]
         pub span: Span,
+    }
+
+    #[derive(Diagnostic)]
+    #[diag("{$def_descr} marked with `#[should_fail]` didn't produce a refinement type error", code = E0999)]
+    pub struct ExpectedNeg {
+        #[primary_span]
+        pub span: Span,
+        pub def_descr: &'static str,
+    }
+
+    #[derive(Diagnostic)]
+    #[diag("call to {$callee} may panic: {$reason}", code = E0999)]
+    pub(super) struct PanicError {
+        #[primary_span]
+        pub(super) span: Span,
+        pub(super) callee: String,
+        pub(super) reason: String,
     }
 }

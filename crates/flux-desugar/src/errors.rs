@@ -1,130 +1,43 @@
+use flux_errors::E0999;
 use flux_macros::Diagnostic;
-use flux_syntax::surface::{BindKind, Path, QPathExpr};
-use itertools::Itertools;
-use rustc_span::{symbol::Ident, Span, Symbol};
+use flux_syntax::surface;
+use rustc_span::{Span, Symbol};
 
 #[derive(Diagnostic)]
-#[diag(desugar_unresolved_var, code = "FLUX")]
-pub(super) struct UnresolvedVar {
-    #[primary_span]
-    #[label]
-    span: Span,
-    var: String,
-    kind: String,
-}
-
-impl UnresolvedVar {
-    pub(super) fn from_qpath(qpath: &QPathExpr, kind: &str) -> Self {
-        Self::from_segments(&qpath.segments, kind, qpath.span)
-    }
-
-    pub(super) fn from_ident(ident: Ident, kind: &str) -> Self {
-        Self { span: ident.span, kind: kind.to_string(), var: format!("{ident}") }
-    }
-
-    pub(super) fn from_path(path: &Path, kind: &str) -> Self {
-        Self::from_segments(&path.segments, kind, path.span)
-    }
-
-    fn from_segments(segments: &[Ident], kind: &str, span: Span) -> Self {
-        Self {
-            span,
-            kind: kind.to_string(),
-            var: format!("{}", segments.iter().format_with("::", |s, f| f(&s.name))),
-        }
-    }
-}
-
-#[derive(Diagnostic)]
-#[diag(desugar_duplicate_param, code = "FLUX")]
-pub(super) struct DuplicateParam {
-    #[primary_span]
-    #[label]
-    span: Span,
-    name: Symbol,
-    #[label(desugar_first_use)]
-    first_use: Span,
-}
-
-impl DuplicateParam {
-    pub(super) fn new(old_ident: Ident, new_ident: Ident) -> Self {
-        debug_assert_eq!(old_ident.name, new_ident.name);
-        Self { span: new_ident.span, name: new_ident.name, first_use: old_ident.span }
-    }
-}
-
-#[derive(Diagnostic)]
-#[diag(desugar_unresolved_sort, code = "FLUX")]
-pub(super) struct UnresolvedSort {
-    #[primary_span]
-    #[label]
-    span: Span,
-    sort: Ident,
-}
-
-impl UnresolvedSort {
-    pub(super) fn new(sort: Ident) -> Self {
-        Self { span: sort.span, sort }
-    }
-}
-
-#[derive(Diagnostic)]
-#[diag(desugar_int_too_large, code = "FLUX")]
+#[diag("integer literal is too large", code = E0999)]
 pub(super) struct IntTooLarge {
     #[primary_span]
     pub(super) span: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(desugar_unexpected_literal, code = "FLUX")]
+#[diag("unexpected literal", code = E0999)]
 pub(super) struct UnexpectedLiteral {
     #[primary_span]
     pub(super) span: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(desugar_invalid_dot_var, code = "FLUX")]
-pub(super) struct InvalidDotVar {
+#[diag("invalid use of path in constructor", code = E0999)]
+pub(super) struct InvalidConstructorPath {
     #[primary_span]
     pub(super) span: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(desugar_sort_arity_mismatch, code = "FLUX")]
-pub(super) struct SortArityMismatch {
+#[diag("expected an `&strg` parameter", code = E0999)]
+pub(super) struct InvalidLoc {
     #[primary_span]
-    #[label]
-    span: Span,
-    expected: usize,
-    found: usize,
-}
-
-impl SortArityMismatch {
-    pub(super) fn new(span: Span, expected: usize, found: usize) -> Self {
-        Self { span, expected, found }
-    }
+    pub(super) span: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(desugar_invalid_unrefined_param, code = "FLUX")]
-pub(super) struct InvalidUnrefinedParam {
-    #[primary_span]
-    #[label]
-    span: Span,
-    var: Ident,
-}
-
-impl InvalidUnrefinedParam {
-    pub(super) fn new(var: Ident) -> Self {
-        Self { var, span: var.span }
-    }
-}
-
-#[derive(Diagnostic)]
-#[diag(desugar_invalid_numeric_suffix, code = "FLUX")]
+#[diag("invalid suffix `{$suffix}` for number literal", code = E0999)]
 pub(super) struct InvalidNumericSuffix {
     #[primary_span]
-    #[label]
+    #[label(
+        "the suffix must be the numeric sort `int`; use a float literal (e.g. `1.0`) for `real`"
+    )]
     span: Span,
     suffix: Symbol,
 }
@@ -136,45 +49,135 @@ impl InvalidNumericSuffix {
 }
 
 #[derive(Diagnostic)]
-#[diag(desugar_unresolved_generic_param, code = "FLUX")]
-#[note]
-pub(super) struct UnresolvedGenericParam {
+#[diag("invalid alias refinement", code = E0999)]
+pub(super) struct InvalidAliasReft {
     #[primary_span]
-    span: Span,
+    #[label("this must be a trait")]
+    pub(super) span: Span,
 }
 
-impl UnresolvedGenericParam {
-    pub(super) fn new(param: Ident) -> Self {
-        Self { span: param.span }
+impl InvalidAliasReft {
+    pub(super) fn new(path: &surface::Path) -> Self {
+        Self { span: path.span }
     }
 }
 
 #[derive(Diagnostic)]
-#[diag(desugar_illegal_binder, code = "FLUX")]
-pub(super) struct IllegalBinder {
+#[diag("invalid variant return type", code = E0999)]
+pub(super) struct InvalidVariantRet {
     #[primary_span]
-    #[label]
-    span: Span,
-    kind: &'static str,
+    pub(super) span: Span,
 }
 
-impl IllegalBinder {
-    pub(super) fn new(span: Span, kind: BindKind) -> Self {
-        Self { span, kind: kind.token_str() }
+impl InvalidVariantRet {
+    pub(super) fn new(path: &surface::Path) -> Self {
+        Self { span: path.span }
     }
 }
 
 #[derive(Diagnostic)]
-#[diag(desugar_invalid_assoc_predicate, code = "FLUX")]
-pub(super) struct InvalidAssocPredicate {
+#[diag("reflected types cannot have refinement annotations", code = E0999)]
+pub(super) struct InvalidReflectedVariant {
     #[primary_span]
-    #[label]
-    span: Span,
-    name: Symbol,
+    pub(super) span: Span,
 }
 
-impl InvalidAssocPredicate {
-    pub(super) fn new(span: Span, name: Symbol) -> Self {
-        Self { span, name }
+impl InvalidReflectedVariant {
+    pub(super) fn new(span: Span) -> Self {
+        Self { span }
     }
+}
+
+#[derive(Diagnostic)]
+#[diag("multiple spreads found in constructor", code = E0999)]
+pub(super) struct MultipleSpreadsInConstructor {
+    #[primary_span]
+    pub(super) span: Span,
+    #[help("previous spread found here. consider removing it")]
+    pub(super) prev_span: Span,
+}
+
+impl MultipleSpreadsInConstructor {
+    pub(super) fn new(span: Span, prev_span: Span) -> Self {
+        Self { span, prev_span }
+    }
+}
+
+#[derive(Diagnostic)]
+#[diag("expression not allowed in this position", code = E0999)]
+pub(super) struct UnsupportedPosition {
+    #[primary_span]
+    span: Span,
+}
+
+impl UnsupportedPosition {
+    pub(super) fn new(span: Span) -> Self {
+        Self { span }
+    }
+}
+
+#[derive(Diagnostic)]
+#[diag("invalid ABI: found `{$abi}`", code = E0999)]
+pub(super) struct InvalidAbi {
+    #[primary_span]
+    #[label("invalid ABI")]
+    span: Span,
+    abi: Symbol,
+}
+
+impl InvalidAbi {
+    pub(super) fn new(abi: flux_syntax::surface::Ident) -> Self {
+        Self { span: abi.span, abi: abi.name }
+    }
+}
+
+#[derive(Diagnostic)]
+#[diag("invalid use of `_`", code = E0999)]
+pub(super) struct UnsupportedHole {
+    #[primary_span]
+    #[label("holes cannot be filled in this position")]
+    span: Span,
+}
+
+impl UnsupportedHole {
+    pub(super) fn new(span: Span) -> Self {
+        Self { span }
+    }
+}
+
+#[derive(Diagnostic)]
+#[diag("final associated refinements must have a body", code = E0999)]
+pub(super) struct FinalAssocReftWithoutBody {
+    #[primary_span]
+    span: Span,
+}
+
+impl FinalAssocReftWithoutBody {
+    pub(super) fn new(span: Span) -> Self {
+        Self { span }
+    }
+}
+
+#[derive(Diagnostic)]
+#[diag("`{$res_descr}` not supported in this position", code = E0999)]
+pub(super) struct UnsupportedConstGenericArg {
+    #[primary_span]
+    #[label("help: try using `_` instead")]
+    span: Span,
+    res_descr: &'static str,
+}
+
+impl UnsupportedConstGenericArg {
+    pub(super) fn new(span: Span, res_descr: &'static str) -> Self {
+        Self { span, res_descr }
+    }
+}
+
+#[derive(Diagnostic)]
+#[diag("unsupported function signature", code = E0999)]
+#[note("{$note}")]
+pub(super) struct UnsupportedSignature<'a> {
+    #[primary_span]
+    pub span: Span,
+    pub note: &'a str,
 }

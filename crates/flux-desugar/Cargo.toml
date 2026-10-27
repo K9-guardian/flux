@@ -17,7 +17,10 @@ flux-errors.workspace = true
 flux-macros.workspace = true
 flux-middle.workspace = true
 flux-syntax.workspace = true
+
 itertools.workspace = true
+rustc-hash.workspace = true
+tracing = "0.1"
 
 [package.metadata.rust-analyzer]
 rustc_private = true

@@ -1,33 +1,35 @@
-#![allow(clippy::pedantic)]
 #![deny(unused_must_use)]
 
-use proc_macro2::TokenStream;
+use std::collections::HashSet;
+
+use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
-use syn::{spanned::Spanned, Attribute, Meta, MetaList, Path};
+use syn::parse::ParseStream;
+use syn::spanned::Spanned;
+use syn::{Attribute, Meta, MetaList, Path, Token};
 use synstructure::{BindingInfo, Structure, VariantInfo};
 
 use super::utils::SubdiagnosticVariant;
-use crate::diagnostics::{
-    error::{invalid_attr, span_err, throw_invalid_attr, throw_span_err, DiagnosticDeriveError},
-    utils::{
-        build_field_mapping, build_suggestion_code, is_doc_comment, new_code_ident,
-        report_error_if_not_applied_to_applicability, report_error_if_not_applied_to_span,
-        should_generate_set_arg, AllowMultipleAlternatives, FieldInfo, FieldInnerTy, FieldMap,
-        HasFieldMap, SetOnce, SpannedOption, SubdiagnosticKind,
-    },
+use crate::diagnostics::error::{
+    DiagnosticDeriveError, invalid_attr, span_err, throw_invalid_attr, throw_span_err,
+};
+use crate::diagnostics::message::Message;
+use crate::diagnostics::utils::{
+    AllowMultipleAlternatives, FieldInfo, FieldInnerTy, FieldMap, SetOnce, SpannedOption,
+    SubdiagnosticKind, build_field_mapping, build_suggestion_code, is_doc_comment, new_code_ident,
+    report_error_if_not_applied_to_applicability, report_error_if_not_applied_to_span,
+    should_generate_arg,
 };
 
-/// The central struct for constructing the `add_to_diagnostic` method from an annotated struct.
-pub(crate) struct SubdiagnosticDeriveBuilder {
+/// The central struct for constructing the `add_to_diag` method from an annotated struct.
+pub(crate) struct SubdiagnosticDerive {
     diag: syn::Ident,
-    f: syn::Ident,
 }
 
-impl SubdiagnosticDeriveBuilder {
+impl SubdiagnosticDerive {
     pub(crate) fn new() -> Self {
         let diag = format_ident!("diag");
-        let f = format_ident!("f");
-        Self { diag, f }
+        Self { diag }
     }
 
     pub(crate) fn into_tokens(self, mut structure: Structure<'_>) -> TokenStream {
@@ -61,6 +63,8 @@ impl SubdiagnosticDeriveBuilder {
                 }
             }
 
+            let mut used_fields: HashSet<proc_macro2::Ident> = HashSet::new();
+
             structure.bind_with(|_| synstructure::BindStyle::Move);
             let variants_ = structure.each_variant(|variant| {
                 let mut builder = SubdiagnosticDeriveVariantBuilder {
@@ -72,11 +76,11 @@ impl SubdiagnosticDeriveBuilder {
                     span_field: None,
                     applicability: None,
                     has_suggestion_parts: false,
+                    has_subdiagnostic: false,
                     is_enum,
+                    used_fields: &mut used_fields,
                 };
-                builder
-                    .into_tokens()
-                    .unwrap_or_else(|v| v.to_compile_error())
+                builder.into_tokens().unwrap_or_else(|v| v.to_compile_error())
             });
 
             quote! {
@@ -87,21 +91,15 @@ impl SubdiagnosticDeriveBuilder {
         };
 
         let diag = &self.diag;
-        let f = &self.f;
+
         let ret = structure.gen_impl(quote! {
-            gen impl rustc_errors::AddToDiagnostic for @Self {
-                fn add_to_diagnostic_with<__F>(self, #diag: &mut rustc_errors::Diagnostic, #f: __F)
-                where
-                    __F: core::ops::Fn(
-                        &mut rustc_errors::Diagnostic,
-                        rustc_errors::SubdiagnosticMessage
-                    ) -> rustc_errors::SubdiagnosticMessage,
-                {
-                    use rustc_errors::{Applicability, IntoDiagnosticArg};
+            gen impl rustc_errors::Subdiagnostic for @Self {
+                fn add_to_diag(self, #diag: &mut rustc_errors::Diag<'_>) {
                     #implementation
                 }
             }
         });
+
         ret
     }
 }
@@ -111,8 +109,8 @@ impl SubdiagnosticDeriveBuilder {
 /// only to be able to destructure and split `self.builder` and the `self.structure` up to avoid a
 /// double mut borrow later on.
 struct SubdiagnosticDeriveVariantBuilder<'parent, 'a> {
-    /// The identifier to use for the generated `DiagnosticBuilder` instance.
-    parent: &'parent SubdiagnosticDeriveBuilder,
+    /// The identifier to use for the generated `Diag` instance.
+    parent: &'parent SubdiagnosticDerive,
 
     /// Info for the current variant (or the type if not an enum).
     variant: &'a VariantInfo<'a>,
@@ -136,14 +134,14 @@ struct SubdiagnosticDeriveVariantBuilder<'parent, 'a> {
     /// during finalization if still `false`.
     has_suggestion_parts: bool,
 
+    /// Set to true when a `#[subdiagnostic]` field is encountered, used to suppress the error
+    /// emitted when no subdiagnostic kinds are specified on the variant itself.
+    has_subdiagnostic: bool,
+
     /// Set to true when this variant is an enum variant rather than just the body of a struct.
     is_enum: bool,
-}
 
-impl<'parent, 'a> HasFieldMap for SubdiagnosticDeriveVariantBuilder<'parent, 'a> {
-    fn get_field_binding(&self, field: &String) -> Option<&TokenStream> {
-        self.fields.get(field)
-    }
+    used_fields: &'parent mut HashSet<proc_macro2::Ident>,
 }
 
 /// Provides frequently-needed information about the diagnostic kinds being derived for this type.
@@ -187,38 +185,38 @@ impl<'a> FromIterator<&'a SubdiagnosticKind> for KindsStatistics {
 impl<'parent, 'a> SubdiagnosticDeriveVariantBuilder<'parent, 'a> {
     fn identify_kind(
         &mut self,
-    ) -> Result<Vec<(SubdiagnosticKind, Path, bool)>, DiagnosticDeriveError> {
-        let mut kind_slugs = vec![];
+    ) -> Result<Vec<(SubdiagnosticKind, Message)>, DiagnosticDeriveError> {
+        let mut kind_messages = vec![];
 
         for attr in self.variant.ast().attrs {
-            let Some(SubdiagnosticVariant { kind, slug, no_span }) =
-                SubdiagnosticVariant::from_attr(attr, self)?
+            let Some(SubdiagnosticVariant { kind, message }) =
+                SubdiagnosticVariant::from_attr(attr, &self.fields, &mut self.used_fields)?
             else {
                 // Some attributes aren't errors - like documentation comments - but also aren't
                 // subdiagnostics.
                 continue;
             };
 
-            let Some(slug) = slug else {
+            let Some(message) = message else {
                 let name = attr.path().segments.last().unwrap().ident.to_string();
                 let name = name.as_str();
 
                 throw_span_err!(
                     attr.span().unwrap(),
                     format!(
-                        "diagnostic slug must be first argument of a `#[{name}(...)]` attribute"
+                        "diagnostic message must be first argument of a `#[{name}(...)]` attribute"
                     )
                 );
             };
 
-            kind_slugs.push((kind, slug, no_span));
+            kind_messages.push((kind, message));
         }
 
-        Ok(kind_slugs)
+        Ok(kind_messages)
     }
 
     /// Generates the code for a field with no attributes.
-    fn generate_field_set_arg(&mut self, binding_info: &BindingInfo<'_>) -> TokenStream {
+    fn generate_field_arg(&mut self, binding_info: &BindingInfo<'_>) -> TokenStream {
         let diag = &self.parent.diag;
 
         let field = binding_info.ast();
@@ -229,9 +227,9 @@ impl<'parent, 'a> SubdiagnosticDeriveVariantBuilder<'parent, 'a> {
         let ident = format_ident!("{}", ident); // strip `r#` prefix, if present
 
         quote! {
-            #diag.set_arg(
-                stringify!(#ident),
-                #field_binding
+            sub_args.insert(
+                stringify!(#ident).into(),
+                rustc_errors::IntoDiagArg::into_diag_arg(#field_binding, &mut #diag.long_ty_path)
             );
         }
     }
@@ -278,15 +276,13 @@ impl<'parent, 'a> SubdiagnosticDeriveVariantBuilder<'parent, 'a> {
             Meta::Path(path) => {
                 self.generate_field_code_inner_path(kind_stats, attr, info, path.clone())
             }
-            Meta::List(list) => {
-                self.generate_field_code_inner_list(
-                    kind_stats,
-                    attr,
-                    info,
-                    list,
-                    clone_suggestion_code,
-                )
-            }
+            Meta::List(list) => self.generate_field_code_inner_list(
+                kind_stats,
+                attr,
+                info,
+                list,
+                clone_suggestion_code,
+            ),
             _ => throw_invalid_attr!(attr),
         }
     }
@@ -305,7 +301,6 @@ impl<'parent, 'a> SubdiagnosticDeriveVariantBuilder<'parent, 'a> {
         let name = name.as_str();
 
         match name {
-            "skip_arg" => Ok(quote! {}),
             "primary_span" => {
                 if kind_stats.has_multipart_suggestion {
                     invalid_attr(attr)
@@ -378,6 +373,12 @@ impl<'parent, 'a> SubdiagnosticDeriveVariantBuilder<'parent, 'a> {
 
                 Ok(quote! {})
             }
+            "subdiagnostic" => {
+                let diag = &self.parent.diag;
+                let binding = &info.binding;
+                self.has_subdiagnostic = true;
+                Ok(quote! { #binding.add_to_diag(#diag); })
+            }
             _ => {
                 let mut span_attrs = vec![];
                 if kind_stats.has_multipart_suggestion {
@@ -389,7 +390,7 @@ impl<'parent, 'a> SubdiagnosticDeriveVariantBuilder<'parent, 'a> {
 
                 invalid_attr(attr)
                     .help(format!(
-                        "only `{}`, `applicability` and `skip_arg` are valid field attributes",
+                        "only `{}`, `applicability` is a valid field attribute",
                         span_attrs.join(", ")
                     ))
                     .emit();
@@ -431,23 +432,35 @@ impl<'parent, 'a> SubdiagnosticDeriveVariantBuilder<'parent, 'a> {
 
                 let mut code = None;
 
-                list.parse_nested_meta(|nested| {
-                    if nested.path.is_ident("code") {
-                        let code_field = new_code_ident();
-                        let span = nested.path.span().unwrap();
-                        let formatting_init = build_suggestion_code(
-                            &code_field,
-                            nested,
-                            self,
-                            AllowMultipleAlternatives::No,
-                        );
-                        code.set_once((code_field, formatting_init), span);
-                    } else {
-                        span_err(
-                            nested.path.span().unwrap(),
-                            "`code` is the only valid nested attribute",
-                        )
-                        .emit();
+                list.parse_args_with(|input: ParseStream<'_>| {
+                    while !input.is_empty() {
+                        let arg_name = input.parse::<Ident>()?;
+                        match arg_name.to_string().as_str() {
+                            "code" => {
+                                let code_field = new_code_ident();
+                                let formatting_init = build_suggestion_code(
+                                    &code_field,
+                                    input,
+                                    &self.fields,
+                                    AllowMultipleAlternatives::No,
+                                )?;
+                                code.set_once(
+                                    (code_field, formatting_init),
+                                    arg_name.span().unwrap(),
+                                );
+                            }
+                            _ => {
+                                span_err(
+                                    arg_name.span().unwrap(),
+                                    "`code` is the only valid nested attribute",
+                                )
+                                .emit();
+                            }
+                        }
+                        if input.is_empty() {
+                            break;
+                        }
+                        input.parse::<Token![,]>()?;
                     }
                     Ok(())
                 })?;
@@ -467,27 +480,46 @@ impl<'parent, 'a> SubdiagnosticDeriveVariantBuilder<'parent, 'a> {
                 };
                 Ok(quote! { suggestions.push((#binding, #code_field)); })
             }
-            _ => {
-                throw_invalid_attr!(attr, |diag| {
-                    let mut span_attrs = vec![];
-                    if kind_stats.has_multipart_suggestion {
-                        span_attrs.push("suggestion_part");
-                    }
-                    if !kind_stats.all_multipart_suggestions {
-                        span_attrs.push("primary_span")
-                    }
-                    diag.help(format!(
-                        "only `{}`, `applicability` and `skip_arg` are valid field attributes",
-                        span_attrs.join(", ")
-                    ))
-                })
-            }
+            _ => throw_invalid_attr!(attr, |diag| {
+                let mut span_attrs = vec![];
+                if kind_stats.has_multipart_suggestion {
+                    span_attrs.push("suggestion_part");
+                }
+                if !kind_stats.all_multipart_suggestions {
+                    span_attrs.push("primary_span")
+                }
+                diag.help(format!(
+                    "only `{}`, `applicability` is a valid field attribute",
+                    span_attrs.join(", ")
+                ))
+            }),
         }
     }
 
-    pub fn into_tokens(&mut self) -> Result<TokenStream, DiagnosticDeriveError> {
-        let kind_slugs = self.identify_kind()?;
-        if kind_slugs.is_empty() {
+    fn is_used_in_message(&self, binding: &BindingInfo<'_>) -> bool {
+        binding.ast().ident.as_ref().is_some_and(|ident| self.used_fields.contains(ident))
+    }
+
+    pub(crate) fn into_tokens(&mut self) -> Result<TokenStream, DiagnosticDeriveError> {
+        let kind_messages = self.identify_kind()?;
+
+        let kind_stats: KindsStatistics = kind_messages.iter().map(|(kind, _msg)| kind).collect();
+
+        let init = if kind_stats.has_multipart_suggestion {
+            quote! { let mut suggestions = Vec::new(); }
+        } else {
+            quote! {}
+        };
+
+        let attr_args: TokenStream = self
+            .variant
+            .bindings()
+            .iter()
+            .filter(|binding| !should_generate_arg(binding.ast()))
+            .map(|binding| self.generate_field_attr_code(binding, kind_stats))
+            .collect();
+
+        if kind_messages.is_empty() && !self.has_subdiagnostic {
             if self.is_enum {
                 // It's okay for a variant to not be a subdiagnostic at all..
                 return Ok(quote! {});
@@ -500,41 +532,32 @@ impl<'parent, 'a> SubdiagnosticDeriveVariantBuilder<'parent, 'a> {
             }
         };
 
-        let kind_stats: KindsStatistics = kind_slugs
-            .iter()
-            .map(|(kind, _slug, _no_span)| kind)
-            .collect();
-
-        let init = if kind_stats.has_multipart_suggestion {
-            quote! { let mut suggestions = Vec::new(); }
-        } else {
-            quote! {}
-        };
-
-        let attr_args: TokenStream = self
+        let plain_args: TokenStream = self
             .variant
             .bindings()
             .iter()
-            .filter(|binding| !should_generate_set_arg(binding.ast()))
-            .map(|binding| self.generate_field_attr_code(binding, kind_stats))
+            .filter_map(|binding| {
+                if should_generate_arg(binding.ast()) && self.is_used_in_message(binding) {
+                    Some(self.generate_field_arg(binding))
+                } else {
+                    None
+                }
+            })
             .collect();
+        let plain_args = quote! {
+            let mut sub_args = rustc_errors::DiagArgMap::default();
+            #plain_args
+        };
 
         let span_field = self.span_field.value_ref();
-
         let diag = &self.parent.diag;
-        let f = &self.parent.f;
         let mut calls = TokenStream::new();
-        for (kind, slug, no_span) in kind_slugs {
+        for (kind, messages) in kind_messages {
             let message = format_ident!("__message");
-            calls.extend(
-                quote! { let #message = #f(#diag, crate::fluent_generated::#slug.into()); },
-            );
+            let message_stream = messages.diag_message();
+            calls.extend(quote! { let #message = rustc_errors::format_diag_message(&#message_stream, &sub_args); });
 
-            let name = format_ident!(
-                "{}{}",
-                if span_field.is_some() && !no_span { "span_" } else { "" },
-                kind
-            );
+            let name = format_ident!("{}{}", if span_field.is_some() { "span_" } else { "" }, kind);
             let call = match kind {
                 SubdiagnosticKind::Suggestion {
                     suggestion_kind,
@@ -586,9 +609,7 @@ impl<'parent, 'a> SubdiagnosticDeriveVariantBuilder<'parent, 'a> {
                     }
                 }
                 _ => {
-                    if let Some(span) = span_field
-                        && !no_span
-                    {
+                    if let Some(span) = span_field {
                         quote! { #diag.#name(#span, #message); }
                     } else {
                         quote! { #diag.#name(#message); }
@@ -599,21 +620,22 @@ impl<'parent, 'a> SubdiagnosticDeriveVariantBuilder<'parent, 'a> {
             calls.extend(call);
         }
 
-        let plain_args: TokenStream = self
-            .variant
-            .bindings()
-            .iter()
-            .filter(|binding| should_generate_set_arg(binding.ast()))
-            .map(|binding| self.generate_field_set_arg(binding))
-            .collect();
-
         let formatting_init = &self.formatting_init;
+
+        // For #[derive(Subdiagnostic)]
+        //
+        // - Store args of the main diagnostic for later restore.
+        // - Add args of subdiagnostic.
+        // - Generate the calls, such as note, label, etc.
+        // - Restore the arguments for allowing main and subdiagnostic share the same fields.
         Ok(quote! {
             #init
             #formatting_init
             #attr_args
+            // #store_args
             #plain_args
             #calls
+            // #restore_args
         })
     }
 }

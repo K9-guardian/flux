@@ -1,10 +1,14 @@
 [book]
 authors = ["Ranjit Jhala"]
 language = "en"
-multilingual = false
 src = "src"
-title = "Flux Documentation"
+title = "The Flux Book"
+
+[output.html.playground]
+editable = true
+line-numbers = false
 
 [output.html]
-additional-css = ["css/flux.css"]
-additional-js = ["js/flux.js"]
+theme = "flux_theme"
+additional-css = ["flux_theme/flux.css"]
+mathjax-support = true

@@ -3,3 +3,10 @@ target
 .liquid
 *.dot
 log
+sysroot/
+fixpoint
+
+.DS_Store
+fixpoint
+*.log
+mir_dump

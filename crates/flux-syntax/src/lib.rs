@@ -1,52 +1,40 @@
-#![feature(rustc_private, box_patterns)]
+#![feature(deref_patterns, rustc_private)]
 
 extern crate rustc_ast;
+extern crate rustc_data_structures;
+extern crate rustc_errors;
 extern crate rustc_span;
 
 pub mod lexer;
+mod parser;
 pub mod surface;
-
-use lalrpop_util::lalrpop_mod;
-use lexer::{Cursor, Location, Token};
+pub mod symbols;
+mod token;
+use lexer::Cursor;
 use rustc_ast::tokenstream::TokenStream;
-use rustc_span::{def_id::LocalDefId, BytePos, Span, SyntaxContext};
+use rustc_span::{
+    BytePos, Ident, Span, Symbol, SyntaxContext, def_id::LocalDefId, edition::Edition,
+};
 use surface::NodeId;
 
-lalrpop_mod!(
-    #[allow(warnings)]
-    #[allow(clippy::all)]
-    grammar
-);
+use crate::parser::lookahead::Expected;
 
 #[derive(Default)]
 pub struct ParseSess {
     next_node_id: usize,
 }
 
-macro_rules! parse {
-    ($sess:expr, $parser:path, $tokens:expr, $span:expr) => {{
-        let mut cx = ParseCtxt::new($sess, $span);
-        <$parser>::new()
-            .parse(&mut cx, Cursor::new($tokens, $span.lo()))
-            .map_err(|err| cx.map_err(err))
-    }};
-}
-
 impl ParseSess {
+    fn cx<'a>(&'a mut self, tokens: &'a TokenStream, span: Span) -> ParseCtxt<'a> {
+        ParseCtxt::new(self, tokens, span)
+    }
+
     pub fn parse_refined_by(
         &mut self,
         tokens: &TokenStream,
         span: Span,
-    ) -> ParseResult<surface::RefinedBy> {
-        parse!(self, grammar::RefinedByParser, tokens, span)
-    }
-
-    pub fn parse_generics(
-        &mut self,
-        tokens: &TokenStream,
-        span: Span,
-    ) -> ParseResult<surface::Generics> {
-        parse!(self, grammar::GenericsParser, tokens, span)
+    ) -> ParseResult<surface::RefineParams> {
+        parser::parse_refined_by(&mut self.cx(tokens, span))
     }
 
     pub fn parse_type_alias(
@@ -54,7 +42,7 @@ impl ParseSess {
         tokens: &TokenStream,
         span: Span,
     ) -> ParseResult<surface::TyAlias> {
-        parse!(self, grammar::TyAliasParser, tokens, span)
+        parser::parse_type_alias(&mut self.cx(tokens, span))
     }
 
     pub fn parse_fn_sig(
@@ -62,43 +50,43 @@ impl ParseSess {
         tokens: &TokenStream,
         span: Span,
     ) -> ParseResult<surface::FnSig> {
-        parse!(self, grammar::FnSigParser, tokens, span)
+        parser::parse_fn_sig(&mut self.cx(tokens, span), token::Eof)
     }
 
-    pub fn parse_trait_assoc_pred(
+    pub fn parse_trait_assoc_reft(
         &mut self,
         tokens: &TokenStream,
         span: Span,
-    ) -> ParseResult<surface::TraitAssocPredicate> {
-        parse!(self, grammar::TraitAssocPredicateParser, tokens, span)
+    ) -> ParseResult<Vec<surface::TraitAssocReft>> {
+        parser::parse_trait_assoc_refts(&mut self.cx(tokens, span))
     }
 
-    pub fn parse_impl_assoc_pred(
+    pub fn parse_impl_assoc_reft(
         &mut self,
         tokens: &TokenStream,
         span: Span,
-    ) -> ParseResult<surface::ImplAssocPredicate> {
-        parse!(self, grammar::ImplAssocPredicateParser, tokens, span)
+    ) -> ParseResult<Vec<surface::ImplAssocReft>> {
+        parser::parse_impl_assoc_refts(&mut self.cx(tokens, span))
     }
 
-    pub fn parse_qual_names(
+    pub fn parse_ident_list(
         &mut self,
         tokens: &TokenStream,
         span: Span,
-    ) -> ParseResult<surface::QualNames> {
-        parse!(self, grammar::QualNamesParser, tokens, span)
+    ) -> ParseResult<Vec<Ident>> {
+        parser::parse_ident_list(&mut self.cx(tokens, span))
     }
 
     pub fn parse_flux_item(
         &mut self,
         tokens: &TokenStream,
         span: Span,
-    ) -> ParseResult<Vec<surface::Item>> {
-        parse!(self, grammar::ItemsParser, tokens, span)
+    ) -> ParseResult<Vec<surface::FluxItem>> {
+        parser::parse_flux_items(&mut self.cx(tokens, span))
     }
 
     pub fn parse_type(&mut self, tokens: &TokenStream, span: Span) -> ParseResult<surface::Ty> {
-        parse!(self, grammar::TyParser, tokens, span)
+        parser::parse_type(&mut self.cx(tokens, span))
     }
 
     pub fn parse_variant(
@@ -106,11 +94,37 @@ impl ParseSess {
         tokens: &TokenStream,
         span: Span,
     ) -> ParseResult<surface::VariantDef> {
-        parse!(self, grammar::VariantParser, tokens, span)
+        parser::parse_variant(&mut self.cx(tokens, span), false)
     }
 
     pub fn parse_expr(&mut self, tokens: &TokenStream, span: Span) -> ParseResult<surface::Expr> {
-        parse!(self, grammar::ExprParser, tokens, span)
+        parser::parse_expr(&mut self.cx(tokens, span), true)
+    }
+
+    pub fn parse_static_info(
+        &mut self,
+        tokens: &TokenStream,
+        span: Span,
+    ) -> ParseResult<surface::StaticInfo> {
+        let ty = parser::parse_type(&mut self.cx(tokens, span))?;
+        Ok(surface::StaticInfo { ty })
+    }
+
+    pub fn parse_constant_info(
+        &mut self,
+        tokens: &TokenStream,
+        span: Span,
+    ) -> ParseResult<surface::ConstantInfo> {
+        let expr = parser::parse_expr(&mut self.cx(tokens, span), true)?;
+        Ok(surface::ConstantInfo { expr: Some(expr) })
+    }
+
+    pub fn parse_yes_or_no_with_reason(
+        &mut self,
+        tokens: &TokenStream,
+        span: Span,
+    ) -> ParseResult<bool> {
+        parser::parse_yes_or_no_with_reason(&mut self.cx(tokens, span))
     }
 
     pub fn next_node_id(&mut self) -> NodeId {
@@ -118,52 +132,71 @@ impl ParseSess {
         self.next_node_id += 1;
         id
     }
+
+    pub fn parse_detached_specs(
+        &mut self,
+        tokens: &TokenStream,
+        span: Span,
+    ) -> ParseResult<surface::DetachedSpecs> {
+        parser::parse_detached_specs(&mut self.cx(tokens, span))
+    }
 }
 
 struct ParseCtxt<'a> {
-    offset: BytePos,
+    sess: &'a mut ParseSess,
     ctx: SyntaxContext,
     parent: Option<LocalDefId>,
-    sess: &'a mut ParseSess,
+    edition: Edition,
+    tokens: Cursor<'a>,
 }
 
 impl<'a> ParseCtxt<'a> {
-    fn new(sess: &'a mut ParseSess, span: Span) -> Self {
-        Self { sess, offset: span.lo(), ctx: span.ctxt(), parent: span.parent() }
+    fn new(sess: &'a mut ParseSess, tokens: &'a TokenStream, span: Span) -> Self {
+        Self {
+            sess,
+            ctx: span.ctxt(),
+            parent: span.parent(),
+            edition: span.edition(),
+            tokens: Cursor::new(tokens, span.lo()),
+        }
     }
 
     fn next_node_id(&mut self) -> NodeId {
         self.sess.next_node_id()
     }
 
-    fn map_span(&self, lo: Location, hi: Location) -> Span {
-        Span::new(lo.0 + self.offset, hi.0 + self.offset, self.ctx, self.parent)
+    fn mk_span(&self, lo: BytePos, hi: BytePos) -> Span {
+        Span::new(lo, hi, self.ctx, self.parent)
     }
 
-    fn map_err(&self, err: LalrpopError) -> ParseError {
-        match err {
-            LalrpopError::InvalidToken { .. } => unreachable!(),
-            LalrpopError::User { error: UserParseError::UnexpectedToken(lo, hi) } => {
-                ParseErrorKind::UnexpectedToken.into_error(self.map_span(lo, hi))
-            }
-            LalrpopError::UnrecognizedEof { location, expected: _ } => {
-                ParseErrorKind::UnexpectedEof.into_error(self.map_span(location, location))
-            }
-            LalrpopError::UnrecognizedToken { token: (start, _, end), expected: _ }
-            | LalrpopError::ExtraToken { token: (start, _, end) } => {
-                ParseErrorKind::UnexpectedToken.into_error(self.map_span(start, end))
-            }
-        }
+    fn lo(&self) -> BytePos {
+        self.tokens.lo()
+    }
+
+    fn hi(&self) -> BytePos {
+        self.tokens.hi()
+    }
+
+    fn is_reserved(&self, sym: Symbol) -> bool {
+        symbols::is_reserved(sym, self.edition)
+    }
+
+    fn unexpected_token(&mut self, expected: Vec<Expected>) -> ParseError {
+        let tok = self.tokens.at(0);
+        let kind = if tok.kind == token::Eof {
+            ParseErrorKind::UnexpectedEof
+        } else {
+            ParseErrorKind::UnexpectedToken { expected }
+        };
+        ParseError { kind, span: self.mk_span(tok.lo, tok.hi) }
+    }
+
+    fn cannot_be_chained(&self, lo: BytePos, hi: BytePos) -> ParseError {
+        ParseError { kind: ParseErrorKind::CannotBeChained, span: self.mk_span(lo, hi) }
     }
 }
 
-pub enum UserParseError {
-    UnexpectedToken(Location, Location),
-}
-
-type LalrpopError = lalrpop_util::ParseError<Location, Token, UserParseError>;
-
-pub type ParseResult<T> = Result<T, ParseError>;
+pub type ParseResult<T = ()> = Result<T, ParseError>;
 
 pub struct ParseError {
     pub kind: ParseErrorKind,
@@ -172,13 +205,10 @@ pub struct ParseError {
 
 #[derive(Debug)]
 pub enum ParseErrorKind {
+    UnexpectedToken { expected: Vec<Expected> },
     UnexpectedEof,
-    UnexpectedToken,
-    IntTooLarge,
-}
-
-impl ParseErrorKind {
-    fn into_error(self, span: Span) -> ParseError {
-        ParseError { kind: self, span }
-    }
+    CannotBeChained,
+    InvalidBinding,
+    InvalidSort,
+    InvalidDetachedSpec,
 }

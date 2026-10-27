@@ -1,178 +1,134 @@
-use flux_common::bug;
-use rustc_hir::{def::DefKind, PrimTy};
-use rustc_span::{
-    def_id::{DefId, LocalDefId},
-    Symbol,
-};
+use flux_arc_interner::List;
+use flux_common::tracked_span_bug;
+use rustc_hir::def::DefKind;
+use rustc_span::def_id::DefId;
 
-use crate::{
-    fhir,
-    global_env::GlobalEnv,
-    intern::List,
-    queries::{QueryErr, QueryResult},
-    rty::{
-        self,
-        fold::TypeFoldable as _,
-        subst::{GenericArgsDelegate, GenericsSubstFolder, GenericsSubstForSort},
-    },
-    rustc::lowering,
-};
+use crate::{global_env::GlobalEnv, queries::QueryResult, query_bug, rty};
 
-impl<'sess, 'tcx> GlobalEnv<'sess, 'tcx> {
-    pub fn sort_of_assoc_pred(
-        &self,
-        impl_id: DefId,
-        name: Symbol,
-    ) -> QueryResult<Option<List<rty::Sort>>> {
-        let trait_ref = self.tcx.impl_trait_ref(impl_id).unwrap();
-        let trait_ref = trait_ref.skip_binder(); // TODO: Yikes?
-        let generics = self.generics_of(impl_id)?;
-        let args = lowering::lower_generic_args(self.tcx, trait_ref.args)
-            .map_err(|err| QueryErr::unsupported(self.tcx, impl_id, err.into_err()))?;
-        let args = self.refine_default_generic_args(&generics, &args)?;
-
-        if let Some(assoc_pred) = self.assoc_predicate_of(trait_ref.def_id, name)?
-            && let rty::AssocPredicateKind::Spec(sorts) = assoc_pred.kind
-        {
-            return Ok(Some(
-                sorts.fold_with(&mut GenericsSubstFolder::new(GenericArgsDelegate(&args), &[])),
-            ));
-        };
-        Ok(None)
+impl GlobalEnv<'_, '_> {
+    pub fn sort_of_self_ty_alias(self, alias_to: DefId) -> QueryResult<Option<rty::Sort>> {
+        let self_ty = self
+            .tcx()
+            .type_of(alias_to)
+            .instantiate_identity()
+            .skip_norm_wip();
+        self.sort_of_rust_ty(alias_to, self_ty)
     }
 
-    pub fn sort_of_alias_pred(
-        &self,
-        alias_pred: &fhir::AliasPred,
-    ) -> QueryResult<Option<List<rty::Sort>>> {
-        let trait_id = alias_pred.trait_id;
-        let name = alias_pred.name;
-        if let Some(assoc_pred) = self.assoc_predicate_of(trait_id, name)?
-            && let rty::AssocPredicateKind::Spec(sorts) = assoc_pred.kind
-        {
-            Ok(Some(sorts.fold_with(&mut GenericsSubstFolder::new(
-                GenericsSubstForSort {
-                    sort_for_param: |param_ty| {
-                        self.sort_of_generic_arg(&alias_pred.generic_args[param_ty.index as usize])
-                            .unwrap()
-                    },
-                },
-                &[],
-            ))))
+    pub fn sort_of_def_id(self, def_id: DefId) -> QueryResult<Option<rty::Sort>> {
+        if let Some(ty) = self.tcx().type_of(def_id).no_bound_vars() {
+            self.sort_of_rust_ty(def_id, ty)
         } else {
             Ok(None)
         }
     }
 
-    pub fn sort_of_bty(&self, bty: &fhir::BaseTy) -> Option<rty::Sort> {
-        match &bty.kind {
-            fhir::BaseTyKind::Path(fhir::QPath::Resolved(_, path)) => self.sort_of_path(path),
-            fhir::BaseTyKind::Slice(_) => Some(rty::Sort::Int),
-        }
-    }
-
-    fn sort_of_path(&self, path: &fhir::Path) -> Option<rty::Sort> {
-        match path.res {
-            fhir::Res::PrimTy(PrimTy::Int(_) | PrimTy::Uint(_)) => Some(rty::Sort::Int),
-            fhir::Res::PrimTy(PrimTy::Bool) => Some(rty::Sort::Bool),
-            fhir::Res::PrimTy(PrimTy::Float(..) | PrimTy::Str | PrimTy::Char) => {
-                Some(rty::Sort::unit())
-            }
-            fhir::Res::Def(DefKind::TyAlias { .. } | DefKind::Enum | DefKind::Struct, def_id) => {
-                let mut sort_args = vec![];
-                let sort_def = self.adt_sort_def_of(def_id);
-                for arg in sort_def.filter_generic_args(&path.args) {
-                    sort_args.push(self.sort_of_ty(arg.expect_type())?);
-                }
-                Some(rty::Sort::Adt(self.adt_sort_def_of(def_id), List::from_vec(sort_args)))
-            }
-            fhir::Res::SelfTyAlias { alias_to, .. } => self.sort_of_self_ty_alias(alias_to),
-            fhir::Res::Def(DefKind::TyParam, def_id) => {
-                self.sort_of_generic_param(def_id.expect_local())
-            }
-            fhir::Res::SelfTyParam { trait_ } => self.sort_of_self_param(trait_),
-            fhir::Res::Def(DefKind::AssocTy | DefKind::OpaqueTy, _) => None,
-            fhir::Res::Def(..) => bug!("unexpected res `{:?}`", path.res),
-        }
-    }
-
-    pub fn sort_of_self_ty_alias(&self, alias_to: DefId) -> Option<rty::Sort> {
-        let self_ty = self.tcx.type_of(alias_to).instantiate_identity();
-        self.sort_of_self_ty(alias_to, self_ty)
-    }
-
-    fn sort_of_generic_param(&self, def_id: LocalDefId) -> Option<rty::Sort> {
-        let param = self.get_generic_param(def_id);
-        match &param.kind {
-            fhir::GenericParamKind::BaseTy | fhir::GenericParamKind::SplTy => {
-                Some(rty::Sort::Param(self.def_id_to_param_ty(def_id)))
-            }
-            fhir::GenericParamKind::Type { .. } | fhir::GenericParamKind::Lifetime => None,
-        }
-    }
-
-    fn sort_of_self_param(&self, owner: DefId) -> Option<rty::Sort> {
-        let generics = self.map().get_generics(self.tcx, owner.expect_local())?;
-        let kind = generics.self_kind.as_ref()?;
-        match kind {
-            fhir::GenericParamKind::BaseTy | fhir::GenericParamKind::SplTy => {
-                Some(rty::Sort::Param(rty::SELF_PARAM_TY))
-            }
-            fhir::GenericParamKind::Type { .. } | fhir::GenericParamKind::Lifetime => None,
-        }
-    }
-
-    fn sort_of_generic_arg(&self, arg: &fhir::GenericArg) -> Option<rty::Sort> {
-        match arg {
-            fhir::GenericArg::Lifetime(_) => None,
-            fhir::GenericArg::Type(ty) => self.sort_of_ty(ty),
-        }
-    }
-
-    pub fn sort_of_ty(&self, ty: &fhir::Ty) -> Option<rty::Sort> {
-        match &ty.kind {
-            fhir::TyKind::BaseTy(bty) | fhir::TyKind::Indexed(bty, _) => self.sort_of_bty(bty),
-            fhir::TyKind::Exists(_, ty) | fhir::TyKind::Constr(_, ty) => self.sort_of_ty(ty),
-            fhir::TyKind::RawPtr(_, _)
-            | fhir::TyKind::Ref(_, _)
-            | fhir::TyKind::Tuple(_)
-            | fhir::TyKind::Array(_, _)
-            | fhir::TyKind::Never => Some(rty::Sort::unit()),
-            fhir::TyKind::Hole(_)
-            | fhir::TyKind::Ptr(_, _)
-            | fhir::TyKind::OpaqueDef(_, _, _, _) => None,
-        }
-    }
-
-    fn sort_of_self_ty(&self, def_id: DefId, ty: rustc_middle::ty::Ty) -> Option<rty::Sort> {
+    fn sort_of_rust_ty(
+        self,
+        def_id: DefId,
+        ty: rustc_middle::ty::Ty,
+    ) -> QueryResult<Option<rty::Sort>> {
         use rustc_middle::ty;
-        match ty.kind() {
+        let sort = match ty.kind() {
             ty::TyKind::Bool => Some(rty::Sort::Bool),
             ty::TyKind::Slice(_) | ty::TyKind::Int(_) | ty::TyKind::Uint(_) => Some(rty::Sort::Int),
+            ty::TyKind::Char => Some(rty::Sort::Char),
+            ty::TyKind::Str => Some(rty::Sort::Str),
             ty::TyKind::Adt(adt_def, args) => {
                 let mut sort_args = vec![];
-                let sort_def = self.adt_sort_def_of(adt_def.did());
+                let sort_def = self.adt_sort_def_of(adt_def.did())?;
                 for arg in sort_def.filter_generic_args(args) {
-                    sort_args.push(self.sort_of_self_ty(def_id, arg.expect_ty())?);
+                    let Some(sort) = self.sort_of_rust_ty(def_id, arg.expect_ty())? else {
+                        return Ok(None);
+                    };
+                    sort_args.push(sort);
                 }
-                Some(rty::Sort::Adt(self.adt_sort_def_of(adt_def.did()), List::from_vec(sort_args)))
+                let ctor = rty::SortCtor::Adt(self.adt_sort_def_of(adt_def.did())?);
+                Some(rty::Sort::App(ctor, List::from_vec(sort_args)))
             }
             ty::TyKind::Param(p) => {
-                let generic_param_def = self
-                    .tcx
-                    .generics_of(def_id)
-                    .param_at(p.index as usize, self.tcx);
-                self.sort_of_generic_param(generic_param_def.def_id.expect_local())
+                let param_def = self.generics_of(def_id)?.param_at(p.index as usize, self)?;
+                if let rty::GenericParamDefKind::Base { .. } = param_def.kind {
+                    Some(rty::Sort::Param(*p))
+                } else {
+                    None
+                }
             }
+            ty::TyKind::RawPtr(..) => Some(rty::Sort::RawPtr),
             ty::TyKind::Float(_)
-            | ty::TyKind::Str
-            | ty::TyKind::Char
-            | ty::TyKind::RawPtr(_)
             | ty::TyKind::Ref(..)
             | ty::TyKind::Tuple(_)
             | ty::TyKind::Array(..)
+            | ty::TyKind::Alias(..)
             | ty::TyKind::Never => Some(rty::Sort::unit()),
-            _ => bug!("unexpected self ty {ty:?}"),
+            _ => None,
+        };
+        Ok(sort)
+    }
+
+    pub fn normalize_free_alias_sort(
+        self,
+        def_id: DefId,
+        args: &rty::GenericArgs,
+        refine_args: &rty::RefineArgs,
+    ) -> QueryResult<rty::Sort> {
+        match self.def_kind(def_id) {
+            DefKind::Impl { .. } => Ok(self.sort_of_self_ty_alias(def_id)?.unwrap()),
+            DefKind::TyAlias => {
+                Ok(self
+                    .type_of(def_id)?
+                    .instantiate(self.tcx(), args, refine_args)
+                    .expect_ctor()
+                    .sort())
+            }
+            DefKind::Struct | DefKind::Enum => Ok(self.adt_sort_def_of(def_id)?.to_sort(args)),
+            _ => Err(query_bug!(def_id, "unexpected weak alias `{:?}`", def_id)),
         }
+    }
+}
+
+impl rty::BaseTy {
+    pub fn sort(&self) -> rty::Sort {
+        match self {
+            rty::BaseTy::Int(_) | rty::BaseTy::Uint(_) | rty::BaseTy::Slice(_)
+            => rty::Sort::Int,
+            rty::BaseTy::RawPtr(..) => rty::Sort::RawPtr,
+            rty::BaseTy::Bool => rty::Sort::Bool,
+            rty::BaseTy::Char => rty::Sort::Char,
+            rty::BaseTy::Adt(adt_def, args) => adt_def.sort(args),
+            rty::BaseTy::Param(param_ty) => rty::Sort::Param(*param_ty),
+            rty::BaseTy::Str => rty::Sort::Str,
+            rty::BaseTy::Alias(alias_ty) => {
+                // HACK(nilehmann) The refinement arguments in `alias_ty` should not influence the
+                // sort. However, we must explicitly remove them because they can contain expression
+                // holes. If we don't remove them, we would generate inference variables for them
+                // which we won't be able to solve.
+                let alias_ty =
+                    rty::AliasTy::new(alias_ty.kind, alias_ty.args.clone(), List::empty());
+                rty::Sort::Alias(alias_ty)
+            }
+            rty::BaseTy::Float(_)
+            | rty::BaseTy::RawPtrMetadata(..) // TODO(RJ): This should be `int` for slice?
+            | rty::BaseTy::Ref(..)
+            | rty::BaseTy::FnPtr(..)
+            | rty::BaseTy::FnDef(..)
+            | rty::BaseTy::Tuple(_)
+            | rty::BaseTy::Array(_, _)
+            | rty::BaseTy::Closure(..)
+            | rty::BaseTy::Coroutine(..)
+            | rty::BaseTy::Dynamic(_, _)
+            | rty::BaseTy::Never
+            | rty::BaseTy::Foreign(..) => rty::Sort::unit(),
+            rty::BaseTy::Infer(_) => tracked_span_bug!(),
+            rty::BaseTy::Pat => rty::Sort::unit()
+        }
+    }
+}
+
+impl rty::AliasReft {
+    pub fn fsort(&self, genv: GlobalEnv) -> QueryResult<rty::FuncSort> {
+        Ok(genv
+            .sort_of_assoc_reft(self.assoc_id)?
+            .instantiate(genv.tcx(), &self.args, &[]))
     }
 }

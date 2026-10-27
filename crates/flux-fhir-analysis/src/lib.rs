@@ -1,438 +1,791 @@
-#![feature(rustc_private, let_chains, box_patterns, if_let_guard, once_cell_try)]
+#![feature(rustc_private)]
 
+extern crate rustc_abi;
+extern crate rustc_ast;
 extern crate rustc_data_structures;
 extern crate rustc_errors;
-extern crate rustc_hash;
 extern crate rustc_hir;
+extern crate rustc_index;
+extern crate rustc_infer;
 extern crate rustc_middle;
 extern crate rustc_span;
+extern crate rustc_trait_selection;
 extern crate rustc_type_ir;
 
-mod annot_check;
 mod conv;
 mod wf;
+use std::{iter, rc::Rc};
 
-use std::rc::Rc;
-
-use flux_common::{bug, dbg};
-use flux_config as config;
-use flux_errors::ResultExt;
-use flux_macros::fluent_messages;
-use flux_middle::{
-    fhir::{self, FluxLocalDefId},
-    global_env::GlobalEnv,
-    intern::List,
-    queries::{Providers, QueryResult},
-    rty::{self, fold::TypeFoldable, refining::Refiner, WfckResults},
+use conv::{AfterSortck, ConvPhase, struct_compat};
+use flux_common::{
+    bug, dbg,
+    iter::IterExt,
+    result::{ErrorEmitter as _, ResultExt},
 };
+use flux_config as config;
+use flux_errors::Errors;
+use flux_middle::{
+    def_id::{FluxDefId, FluxId, MaybeExternId},
+    fhir::{
+        self, ForeignItem, ForeignItemKind, ImplItem, ImplItemKind, Item, ItemKind, TraitItem,
+        TraitItemKind, visit::Visitor as _,
+    },
+    global_env::GlobalEnv,
+    queries::{Providers, QueryErr, QueryResult},
+    query_bug,
+    rty::{
+        self, AssocReft, Binder, WfckResults,
+        fold::TypeFoldable,
+        refining::{self, Refiner},
+    },
+};
+use flux_rustc_bridge::lowering::Lower;
 use itertools::Itertools;
-use rustc_errors::{DiagnosticMessage, ErrorGuaranteed, SubdiagnosticMessage};
-use rustc_hash::FxHashMap;
-use rustc_hir::{def::DefKind, def_id::LocalDefId, OwnerId};
-use rustc_span::Symbol;
-
-fluent_messages! { "../locales/en-US.ftl" }
+use rustc_abi::FIRST_VARIANT;
+use rustc_data_structures::unord::{UnordMap, UnordSet};
+use rustc_errors::ErrorGuaranteed;
+use rustc_hir::{
+    OwnerId,
+    def::{CtorOf, DefKind},
+    def_id::{DefId, LocalDefId},
+};
+use rustc_span::Span;
 
 pub fn provide(providers: &mut Providers) {
-    *providers = Providers {
-        defns,
-        qualifiers,
-        func_decls,
-        adt_sort_def_of,
-        check_wf,
-        adt_def,
-        type_of,
-        variants_of,
-        fn_sig,
-        generics_of,
-        refinement_generics_of,
-        predicates_of,
-        assoc_predicates_of,
-        item_bounds,
-    };
+    providers.spec_funcs = spec_funcs;
+    providers.func_sort = func_sort;
+    providers.func_span = flux_def_ident_span;
+    providers.qualifiers = qualifiers;
+    providers.axioms = axioms;
+    providers.prim_rel = prim_rel;
+    providers.adt_sort_def_of = adt_sort_def_of;
+    providers.check_wf = check_wf;
+    providers.late_bound_refinement_params = late_bound_refinement_params;
+    providers.adt_def = adt_def;
+    providers.invariants_of = invariants_of;
+    providers.constant_info = constant_info;
+    providers.static_info = static_info;
+    providers.type_of = type_of;
+    providers.variants_of = variants_of;
+    providers.fn_sig = fn_sig;
+    providers.generics_of = generics_of;
+    providers.refinement_generics_of = refinement_generics_of;
+    providers.predicates_of = predicates_of;
+    providers.assoc_refinements_of = assoc_refinements_of;
+    providers.sort_of_assoc_reft = sort_of_assoc_reft;
+    providers.assoc_refinement_body = assoc_refinement_body;
+    providers.default_assoc_refinement_body = default_assoc_refinement_body;
+    providers.item_bounds = item_bounds;
+    providers.sort_decl_param_count = sort_decl_param_count;
 }
 
-fn adt_sort_def_of(genv: &GlobalEnv, def_id: LocalDefId) -> rty::AdtSortDef {
-    conv::conv_adt_sort_def(genv, genv.map().refined_by(def_id))
+fn sort_decl_param_count(genv: GlobalEnv, def_id: FluxId<MaybeExternId>) -> usize {
+    genv.fhir_sort_decl(def_id.local_id()).unwrap().params
 }
 
-fn func_decls(genv: &GlobalEnv) -> FxHashMap<Symbol, rty::FuncDecl> {
-    genv.map()
-        .func_decls()
-        .map(|decl| (decl.name, conv::conv_func_decl(genv, decl)))
-        .collect()
+fn adt_sort_def_of(genv: GlobalEnv, def_id: MaybeExternId) -> QueryResult<rty::AdtSortDef> {
+    let kind = genv.fhir_expect_refinement_kind(def_id.local_id())?;
+    conv::conv_adt_sort_def(genv, def_id, kind)
 }
 
-fn defns(genv: &GlobalEnv) -> QueryResult<rty::Defns> {
-    let defns = genv
-        .map()
-        .defns()
-        .map(|defn| -> QueryResult<_> {
-            let wfckresults = genv.check_wf(FluxLocalDefId::Flux(defn.name))?;
-            let defn = conv::conv_defn(genv, defn, &wfckresults);
-            Ok((defn.name, defn))
+fn func_sort(genv: GlobalEnv, def_id: FluxId<MaybeExternId>) -> rty::PolyFuncSort {
+    let func = genv.fhir_spec_func_body(def_id.local_id()).unwrap();
+    match conv::conv_func_decl(genv, func).emit(&genv) {
+        Ok(normalized) => normalized,
+        Err(err) => {
+            genv.sess().abort(err);
+        }
+    }
+}
+
+fn flux_def_ident_span(genv: GlobalEnv, def_id: FluxId<MaybeExternId>) -> Span {
+    genv.fhir_spec_func_body(def_id.local_id())
+        .unwrap()
+        .ident_span
+}
+
+fn spec_funcs(genv: GlobalEnv) -> rty::SpecFuncs {
+    match try_spec_funcs(genv) {
+        Ok(funcs) => funcs,
+        Err(err) => {
+            genv.sess().abort(err);
+        }
+    }
+}
+
+fn try_spec_funcs(genv: GlobalEnv) -> Result<rty::SpecFuncs, ErrorGuaranteed> {
+    let mut funcs = vec![];
+
+    // Collect and emit all errors
+    let mut errors = Errors::new(genv.sess());
+    for (_, item) in genv.fhir_iter_flux_items() {
+        let fhir::FluxItem::Func(func) = item else { continue };
+        let Some(wfckresults) = wf::check_flux_item(genv, item).collect_err(&mut errors) else {
+            continue;
+        };
+        let mut cx = AfterSortck::new(genv, &wfckresults).into_conv_ctxt();
+        let Ok(spec_func) = cx.conv_spec_func(func).emit(&errors) else { continue };
+        funcs.push((func.def_id, spec_func));
+    }
+    errors.to_result()?;
+
+    rty::SpecFuncs::new(funcs)
+        .map_err(|cycle| {
+            let span = genv
+                .fhir_spec_func_body(cycle[0])
+                .unwrap()
+                .body
+                .unwrap()
+                .span;
+            errors::DefinitionCycle::new(span, cycle)
         })
-        .try_collect()?;
-    let defns = rty::Defns::new(defns).map_err(|cycle| {
-        let span = genv.map().defn(cycle[0]).unwrap().expr.span;
-        genv.sess
-            .emit_err(errors::DefinitionCycle::new(span, cycle))
-    })?;
-
-    Ok(defns)
+        .emit(&genv)
 }
 
-fn qualifiers(genv: &GlobalEnv) -> QueryResult<Vec<rty::Qualifier>> {
-    genv.map()
-        .qualifiers()
+fn qualifiers(genv: GlobalEnv) -> QueryResult<Vec<rty::Qualifier>> {
+    genv.fhir_qualifiers()
         .map(|qualifier| {
-            let wfckresults = genv.check_wf(FluxLocalDefId::Flux(qualifier.name))?;
-            normalize(genv, conv::conv_qualifier(genv, qualifier, &wfckresults))
+            let wfckresults = wf::check_flux_item(genv, fhir::FluxItem::Qualifier(qualifier))?;
+            Ok(AfterSortck::new(genv, &wfckresults)
+                .into_conv_ctxt()
+                .conv_qualifier(qualifier)?
+                .reduce(genv))
         })
         .try_collect()
 }
 
-fn invariants_of(genv: &GlobalEnv, def_id: LocalDefId) -> QueryResult<Vec<rty::Invariant>> {
-    let (params, invariants) = match genv.tcx.def_kind(def_id) {
-        DefKind::Enum => {
-            let enum_def = genv.map().get_enum(def_id);
-            (&enum_def.params, &enum_def.invariants)
-        }
-        DefKind::Struct => {
-            let struct_def = genv.map().get_struct(def_id);
-            (&struct_def.params, &struct_def.invariants)
-        }
-        kind => bug!("expected struct or enum found `{kind:?}`"),
-    };
-    let wfckresults = genv.check_wf(def_id)?;
-    conv::conv_invariants(genv, def_id, params, invariants, &wfckresults)
-        .into_iter()
-        .map(|invariant| normalize(genv, invariant))
-        .collect()
+fn axioms(genv: GlobalEnv) -> QueryResult<Vec<rty::Axiom>> {
+    genv.fhir_axioms()
+        .map(|axiom| {
+            let wfckresults = wf::check_flux_item(genv, fhir::FluxItem::Axiom(axiom))?;
+            let body = AfterSortck::new(genv, &wfckresults)
+                .into_conv_ctxt()
+                .conv_axiom(axiom)?
+                .reduce(genv);
+            // The patterns are computed here, *after* reducing the body, so it is only done
+            // once (instead of once per query).
+            rty::Axiom::new(genv, axiom.def_id, body).map_err(|rty::UncoveredAxiomVar(var)| {
+                let param = &axiom.args[var.as_usize()];
+                QueryErr::Emitted(
+                    genv.emit(errors::IllFormedAxiom::new(axiom.span, param.span, param.name)),
+                )
+            })
+        })
+        .try_collect()
 }
 
-fn adt_def(genv: &GlobalEnv, def_id: LocalDefId) -> QueryResult<rty::AdtDef> {
-    let invariants = invariants_of(genv, def_id)?;
-    match genv.tcx.def_kind(def_id) {
-        DefKind::Enum => Ok(conv::adt_def_for_enum(genv, invariants, genv.map().get_enum(def_id))),
-        DefKind::Struct => {
-            Ok(conv::adt_def_for_struct(genv, invariants, genv.map().get_struct(def_id)))
-        }
-        kind => bug!("expected struct or enum found `{kind:?}`"),
+fn primop_props(genv: GlobalEnv) -> QueryResult<Vec<rty::PrimOpProp>> {
+    genv.fhir_primop_props()
+        .map(|primop_prop| {
+            let wfckresults = wf::check_flux_item(genv, fhir::FluxItem::PrimOpProp(primop_prop))?;
+            Ok(AfterSortck::new(genv, &wfckresults)
+                .into_conv_ctxt()
+                .conv_primop_prop(primop_prop)?
+                .reduce(genv))
+        })
+        .try_collect()
+}
+
+fn conjoin_bind_exprs(exprs: Vec<Binder<rty::Expr>>) -> Binder<rty::Expr> {
+    let mut iter = exprs.into_iter();
+    let first = iter.next().unwrap();
+    let sorts = first.sorts();
+    let bodies = iter::once(first.skip_binder()).chain(iter.map(|expr| expr.skip_binder()));
+    let expr = rty::Expr::and_from_iter(bodies);
+    Binder::bind_with_sorts(expr, &sorts)
+}
+
+fn prim_rel(genv: GlobalEnv) -> QueryResult<UnordMap<rty::BinOp, rty::PrimRel>> {
+    let primop_props = primop_props(genv)?
+        .into_iter()
+        .into_group_map_by(|primop_prop| primop_prop.op.clone());
+
+    let mut res = UnordMap::default();
+    for (op, props) in primop_props {
+        let exprs = props
+            .iter()
+            .map(|prop| prop.body.clone())
+            .collect::<Vec<_>>();
+        let body = conjoin_bind_exprs(exprs);
+        res.insert(op, rty::PrimRel { body });
     }
+    Ok(res)
+}
+
+fn adt_def(genv: GlobalEnv, def_id: MaybeExternId) -> QueryResult<rty::AdtDef> {
+    let item = genv.fhir_expect_item(def_id.local_id())?;
+
+    let adt_def = genv.tcx().adt_def(def_id.resolved_id()).lower(genv.tcx());
+
+    let is_opaque = matches!(item.kind, fhir::ItemKind::Struct(def) if def.is_opaque());
+
+    Ok(rty::AdtDef::new(adt_def, genv.adt_sort_def_of(def_id)?, is_opaque))
+}
+
+fn constant_info(genv: GlobalEnv, def_id: MaybeExternId) -> QueryResult<rty::ConstantInfo> {
+    let node = genv.fhir_node(def_id.local_id())?;
+    let Some(sort) = genv.sort_of_def_id(def_id.resolved_id()).emit(&genv)? else {
+        return Ok(rty::ConstantInfo::Uninterpreted);
+    };
+    let tcx = genv.tcx();
+    match node {
+        fhir::Node::Item(fhir::Item { kind: fhir::ItemKind::Const(Some(expr)), .. }) => {
+            // If the constant has a `#[consant(expr)]` annotation we use that
+            let owner = def_id.map(|def_id| rustc_hir::OwnerId { def_id });
+            let wfckresults = wf::check_constant_expr(genv, owner, expr, &sort)?;
+            let expr = AfterSortck::new(genv, &wfckresults)
+                .into_conv_ctxt()
+                .conv_constant_expr(expr)?;
+            Ok(rty::ConstantInfo::Interpreted(expr, sort))
+        }
+        fhir::Node::Item(fhir::Item { kind: fhir::ItemKind::Const(None), .. })
+        | fhir::Node::AnonConst
+        | fhir::Node::ImplItem(fhir::ImplItem { kind: fhir::ImplItemKind::Const, .. }) => {
+            // For other constants, we try to evaluate them if they are integral
+            if let Some(ty) = tcx.type_of(def_id).no_bound_vars()
+                && ty.is_integral()
+                && let Ok(val) = tcx.const_eval_poly(def_id.resolved_id())
+                && let Some(val) = val.try_to_scalar_int()
+                && let Some(constant_) = rty::Constant::from_scalar_int(tcx, val, &ty)
+            {
+                // FIXME(nilehmann) we should probably report an error in case const evaluation
+                // fails instead of silently ignore it.
+                Ok(rty::ConstantInfo::Interpreted(rty::Expr::constant(constant_), rty::Sort::Int))
+            } else {
+                Ok(rty::ConstantInfo::Uninterpreted)
+            }
+        }
+        fhir::Node::TraitItem(fhir::TraitItem { kind: fhir::TraitItemKind::Const, .. }) => {
+            Ok(rty::ConstantInfo::Uninterpreted)
+        }
+        _ => Err(query_bug!(def_id.local_id(), "expected const item"))?,
+    }
+}
+
+/// The type of a static: its spec if it has one, or the default refinement of its rust type.
+fn static_info(genv: GlobalEnv, def_id: MaybeExternId) -> QueryResult<rty::Ty> {
+    if let fhir::Node::Item(fhir::Item { kind: fhir::ItemKind::Static(Some(ty)), .. }) =
+        genv.fhir_node(def_id.local_id())?
+    {
+        let wfckresults = genv.check_wf(def_id.local_id())?;
+        AfterSortck::new(genv, &wfckresults)
+            .into_conv_ctxt()
+            .conv_static_ty(ty)
+    } else {
+        rty::refining::default_static_ty(genv, def_id.resolved_id())
+    }
+}
+
+/// Errors are reported at the definition of the adt. If the invariants fail to convert, we
+/// continue as if the adt had no invariants. This is sound because the invariants are then
+/// neither checked (when constructing the adt) nor assumed (when using it).
+fn invariants_of(
+    genv: GlobalEnv,
+    def_id: MaybeExternId,
+) -> rty::EarlyBinder<rty::List<rty::Invariant>> {
+    let invariants = try_invariants_of(genv, def_id).unwrap_or_else(|err| {
+        if !matches!(err, QueryErr::Emitted(_)) {
+            genv.emit(err);
+        }
+        vec![]
+    });
+    rty::EarlyBinder(rty::List::from_vec(invariants))
+}
+
+fn try_invariants_of(genv: GlobalEnv, def_id: MaybeExternId) -> QueryResult<Vec<rty::Invariant>> {
+    let item = genv.fhir_expect_item(def_id.local_id())?;
+    let (params, invariants) = match &item.kind {
+        fhir::ItemKind::Enum(enum_def) => (enum_def.params, enum_def.invariants),
+        fhir::ItemKind::Struct(struct_def) => (struct_def.params, struct_def.invariants),
+        _ => Err(query_bug!(item.owner_id.local_id(), "expected struct or enum"))?,
+    };
+    let wfckresults = wf::check_invariants(genv, item.owner_id, params, invariants)?;
+    AfterSortck::new(genv, &wfckresults)
+        .into_conv_ctxt()
+        .conv_invariants(item.owner_id.map(|it| it.def_id), params, invariants)
 }
 
 fn predicates_of(
-    genv: &GlobalEnv,
-    local_id: LocalDefId,
+    genv: GlobalEnv,
+    def_id: MaybeExternId,
 ) -> QueryResult<rty::EarlyBinder<rty::GenericPredicates>> {
-    if let Some(generics) = genv.map().get_generics(genv.tcx, local_id) {
-        let wfckresults = genv.check_wf(local_id)?;
-        conv::conv_generic_predicates(genv, local_id, &generics.predicates, &wfckresults)
-    } else {
-        Ok(rty::EarlyBinder(rty::GenericPredicates {
-            parent: genv.tcx.opt_parent(local_id.to_def_id()),
-            predicates: List::empty(),
-        }))
-    }
-}
-
-fn assoc_predicates_of(
-    genv: &GlobalEnv,
-    local_id: LocalDefId,
-) -> QueryResult<rty::AssocPredicates> {
-    match genv.tcx.def_kind(local_id) {
-        DefKind::Impl { .. } => {
-            let assoc_predicates = &genv.map().get_impl(local_id).assoc_predicates;
-            let wfckresults = genv.check_wf(local_id)?;
-            Ok(conv::conv_impl_assoc_predicates(genv, assoc_predicates, &wfckresults))
-        }
-        DefKind::Trait => {
-            let assoc_predicates = &genv.map().get_trait(local_id).assoc_predicates;
-            Ok(conv::conv_trait_assoc_predicates(genv, assoc_predicates))
-        }
-        _ => bug!("expected trait or impl"),
-    }
-}
-
-fn item_bounds(
-    genv: &GlobalEnv,
-    local_id: LocalDefId,
-) -> QueryResult<rty::EarlyBinder<List<rty::Clause>>> {
-    let wfckresults = genv.check_wf(local_id)?;
-    let opaque_ty = genv.map().get_opaque_ty(local_id);
-    Ok(rty::EarlyBinder(conv::conv_opaque_ty(genv, local_id, opaque_ty, &wfckresults)?))
-}
-
-fn generics_of(genv: &GlobalEnv, local_id: LocalDefId) -> QueryResult<rty::Generics> {
-    let def_id = local_id.to_def_id();
-    let rustc_generics = genv.lower_generics_of(local_id)?;
-
-    let def_kind = genv.tcx.def_kind(def_id);
-    match def_kind {
+    match genv.def_kind(def_id) {
         DefKind::Impl { .. }
         | DefKind::Struct
         | DefKind::Enum
-        | DefKind::TyAlias { .. }
-        | DefKind::OpaqueTy
+        | DefKind::Union
+        | DefKind::TyAlias
         | DefKind::AssocFn
         | DefKind::AssocTy
         | DefKind::Trait
         | DefKind::Fn => {
-            let is_trait = (def_kind == DefKind::Trait).then_some(local_id);
+            let did = def_id.local_id();
             let generics = genv
-                .map()
-                .get_generics(genv.tcx, local_id)
-                .unwrap_or_else(|| bug!("no generics for {:?}", def_id));
-            conv::conv_generics(&rustc_generics, generics, is_trait)
+                .fhir_get_generics(did)?
+                .ok_or_else(|| query_bug!(did, "no generics for {def_id:?}"))?;
+            let wfckresults = genv.check_wf(did)?;
+            AfterSortck::new(genv, &wfckresults)
+                .into_conv_ctxt()
+                .conv_generic_predicates(def_id, generics)
         }
-        DefKind::Closure | DefKind::Coroutine => {
-            Ok(rty::Generics {
-                params: List::empty(),
-                parent: rustc_generics.parent(),
-                parent_count: rustc_generics.parent_count(),
-            })
+        DefKind::OpaqueTy | DefKind::Closure | DefKind::Static { .. } => {
+            Ok(rty::EarlyBinder(rty::GenericPredicates {
+                parent: genv.tcx().clauses_of(def_id).parent,
+                predicates: rty::List::empty(),
+            }))
         }
-        kind => bug!("generics_of called on `{def_id:?}` with kind `{kind:?}`"),
+        kind => {
+            Err(query_bug!(
+                def_id.local_id(),
+                "predicates_of called on `{def_id:?}` with kind `{kind:?}`"
+            ))?
+        }
+    }
+}
+
+fn assoc_refinements_of(
+    genv: GlobalEnv,
+    def_id: MaybeExternId,
+) -> QueryResult<rty::AssocRefinements> {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "We are iterationg over associated refinemens in fhir, so this is the *source of of truth*"
+    )]
+    let predicates = match &genv.fhir_expect_item(def_id.local_id())?.kind {
+        fhir::ItemKind::Trait(trait_) => {
+            trait_
+                .assoc_refinements
+                .iter()
+                .map(|assoc_reft| {
+                    AssocReft::new(
+                        FluxDefId::new(def_id.resolved_id(), assoc_reft.name),
+                        assoc_reft.final_,
+                        assoc_reft.span,
+                    )
+                })
+                .collect()
+        }
+        fhir::ItemKind::Impl(impl_) => {
+            impl_
+                .assoc_refinements
+                .iter()
+                .map(|assoc_reft| {
+                    AssocReft::new(
+                        FluxDefId::new(def_id.resolved_id(), assoc_reft.name),
+                        false,
+                        assoc_reft.span,
+                    )
+                })
+                .collect()
+        }
+        _ => Err(query_bug!(def_id.resolved_id(), "expected trait or impl"))?,
+    };
+    Ok(rty::AssocRefinements { items: predicates })
+}
+
+fn default_assoc_refinement_body(
+    genv: GlobalEnv,
+    trait_assoc_id: FluxId<MaybeExternId>,
+) -> QueryResult<Option<rty::EarlyBinder<rty::Lambda>>> {
+    let trait_id = trait_assoc_id.parent();
+    let assoc_reft = genv
+        .fhir_expect_item(trait_id.local_id())?
+        .expect_trait()
+        .find_assoc_reft(trait_assoc_id.name())
+        .unwrap();
+    let Some(body) = assoc_reft.body else { return Ok(None) };
+    let wfckresults = genv.check_wf(trait_id.local_id())?;
+    let mut cx = AfterSortck::new(genv, &wfckresults).into_conv_ctxt();
+    let body = cx.conv_assoc_reft_body(assoc_reft.params, &body, &assoc_reft.output)?;
+    Ok(Some(rty::EarlyBinder(body)))
+}
+
+fn assoc_refinement_body(
+    genv: GlobalEnv,
+    impl_assoc_id: FluxId<MaybeExternId>,
+) -> QueryResult<rty::EarlyBinder<rty::Lambda>> {
+    let impl_id = impl_assoc_id.parent();
+
+    let assoc_reft = genv
+        .fhir_expect_item(impl_id.local_id())?
+        .expect_impl()
+        .find_assoc_reft(impl_assoc_id.name())
+        .unwrap();
+
+    let wfckresults = genv.check_wf(impl_id.local_id())?;
+    let mut cx = AfterSortck::new(genv, &wfckresults).into_conv_ctxt();
+    let body = cx.conv_assoc_reft_body(assoc_reft.params, &assoc_reft.body, &assoc_reft.output)?;
+    Ok(rty::EarlyBinder(body))
+}
+
+fn sort_of_assoc_reft(
+    genv: GlobalEnv,
+    assoc_id: FluxId<MaybeExternId>,
+) -> QueryResult<rty::EarlyBinder<rty::FuncSort>> {
+    let container_id = assoc_id.parent();
+
+    match &genv.fhir_expect_item(container_id.local_id())?.kind {
+        fhir::ItemKind::Trait(trait_) => {
+            let assoc_reft = trait_.find_assoc_reft(assoc_id.name()).unwrap();
+            let wfckresults = WfckResults::new(container_id.map(|def_id| OwnerId { def_id }));
+            let mut cx = AfterSortck::new(genv, &wfckresults).into_conv_ctxt();
+            let inputs = assoc_reft
+                .params
+                .iter()
+                .map(|p| cx.conv_sort(&p.sort))
+                .try_collect_vec()?;
+            let output = cx.conv_sort(&assoc_reft.output)?;
+            Ok(rty::EarlyBinder(rty::FuncSort::new(inputs, output)))
+        }
+        fhir::ItemKind::Impl(impl_) => {
+            let assoc_reft = impl_.find_assoc_reft(assoc_id.name()).unwrap();
+            let wfckresults = WfckResults::new(container_id.map(|def_id| OwnerId { def_id }));
+            let mut cx = AfterSortck::new(genv, &wfckresults).into_conv_ctxt();
+            let inputs = assoc_reft
+                .params
+                .iter()
+                .map(|p| cx.conv_sort(&p.sort))
+                .try_collect_vec()?;
+            let output = cx.conv_sort(&assoc_reft.output)?;
+            Ok(rty::EarlyBinder(rty::FuncSort::new(inputs, output)))
+        }
+        _ => Err(query_bug!(container_id.local_id(), "expected trait or impl")),
+    }
+}
+
+fn item_bounds(
+    genv: GlobalEnv,
+    def_id: MaybeExternId,
+) -> QueryResult<rty::EarlyBinder<rty::Clauses>> {
+    let parent = genv.tcx().local_parent(def_id.local_id());
+    let wfckresults = genv.check_wf(parent)?;
+    let opaque_ty = genv.fhir_node(def_id.local_id())?.expect_opaque_ty();
+    Ok(rty::EarlyBinder(
+        AfterSortck::new(genv, &wfckresults)
+            .into_conv_ctxt()
+            .conv_opaque_ty(opaque_ty)?,
+    ))
+}
+
+fn generics_of(genv: GlobalEnv, def_id: MaybeExternId) -> QueryResult<rty::Generics> {
+    let def_kind = genv.def_kind(def_id);
+    let generics = match def_kind {
+        DefKind::Impl { .. }
+        | DefKind::Struct
+        | DefKind::Enum
+        | DefKind::Union
+        | DefKind::TyAlias
+        | DefKind::AssocFn
+        | DefKind::AssocTy
+        | DefKind::Trait
+        | DefKind::Fn => {
+            let is_trait = def_kind == DefKind::Trait;
+            let generics = genv
+                .fhir_get_generics(def_id.local_id())?
+                .ok_or_else(|| query_bug!(def_id.local_id(), "no generics for {def_id:?}"))?;
+            conv::conv_generics(genv, generics, def_id, is_trait)
+        }
+        DefKind::OpaqueTy
+        | DefKind::Closure
+        | DefKind::TraitAlias
+        | DefKind::Ctor(..)
+        | DefKind::Static { .. } => refining::refine_generics(&genv.lower_generics_of(def_id)),
+        kind => {
+            Err(query_bug!(
+                def_id.local_id(),
+                "generics_of called on `{def_id:?}` with kind `{kind:?}`"
+            ))?
+        }
+    };
+    if config::dump_rty() {
+        dbg::dump_item_info(genv.tcx(), def_id.resolved_id(), "generics.rty", &generics).unwrap();
+    }
+    Ok(generics)
+}
+
+/// See [`GlobalEnv::late_bound_refinement_params`]
+fn late_bound_refinement_params<'genv>(
+    genv: GlobalEnv<'genv, '_>,
+    def_id: LocalDefId,
+) -> QueryResult<&'genv [fhir::ParamId]> {
+    let node = genv.fhir_expect_owner_node(def_id)?;
+    let Some(fn_sig) = node.fn_sig() else { return Ok(&[]) };
+    let generics = node.generics();
+
+    // Where-clauses and opaque types are converted separately from the signature (as clauses of the
+    // item or the opaque type), so params mentioned there must be early bound.
+    let mut appears_in_clauses = ParamCollector::default();
+    for pred in generics.predicates.unwrap_or_default() {
+        appears_in_clauses.visit_where_predicate(pred);
+    }
+    OpaqueTyParamCollector(&mut appears_in_clauses).visit_fn_sig(fn_sig);
+
+    let late_bound = generics
+        .refinement_params
+        .iter()
+        // Locations are always early bound
+        .filter(|param| !param.kind.is_loc() && !matches!(param.sort, fhir::Sort::Loc))
+        .filter(|param| !appears_in_clauses.params.contains(&param.id))
+        .map(|param| param.id)
+        .collect_vec();
+    Ok(genv.alloc_slice(&late_bound))
+}
+
+/// Collects all refinement params mentioned in the visited nodes.
+#[derive(Default)]
+struct ParamCollector {
+    params: UnordSet<fhir::ParamId>,
+}
+
+impl<'fhir> fhir::visit::Visitor<'fhir> for ParamCollector {
+    fn visit_path_expr(&mut self, path: &fhir::PathExpr<'fhir>) {
+        if let fhir::Res::Param(_, id) = path.res {
+            self.params.insert(id);
+        }
+    }
+}
+
+/// Collects the refinement params mentioned in the bounds of opaque types.
+struct OpaqueTyParamCollector<'a>(&'a mut ParamCollector);
+
+impl<'fhir> fhir::visit::Visitor<'fhir> for OpaqueTyParamCollector<'_> {
+    fn visit_opaque_ty(&mut self, opaque_ty: &fhir::OpaqueTy<'fhir>) {
+        self.0.visit_opaque_ty(opaque_ty);
     }
 }
 
 fn refinement_generics_of(
-    genv: &GlobalEnv,
-    local_id: LocalDefId,
-) -> QueryResult<rty::RefinementGenerics> {
-    let parent = genv.tcx.generics_of(local_id).parent;
+    genv: GlobalEnv,
+    def_id: MaybeExternId,
+) -> QueryResult<rty::EarlyBinder<rty::RefinementGenerics>> {
+    let parent = genv.tcx().generics_of(def_id).parent;
     let parent_count =
         if let Some(def_id) = parent { genv.refinement_generics_of(def_id)?.count() } else { 0 };
-    match genv.tcx.def_kind(local_id) {
-        DefKind::Fn | DefKind::AssocFn => {
-            let fn_sig = genv.map().get_fn_sig(local_id);
-            let wfckresults = genv.check_wf(local_id)?;
-            let params = conv::conv_refinement_generics(
-                genv,
-                &fn_sig.generics.refinement_params,
-                Some(&wfckresults),
-            );
-            Ok(rty::RefinementGenerics { parent, parent_count, params })
+    let generics = match genv.fhir_node(def_id.local_id())? {
+        fhir::Node::Item(fhir::Item {
+            kind: fhir::ItemKind::Fn(..) | fhir::ItemKind::TyAlias(..),
+            ..
+        })
+        | fhir::Node::TraitItem(fhir::TraitItem { kind: fhir::TraitItemKind::Fn(..), .. })
+        | fhir::Node::ImplItem(fhir::ImplItem { kind: fhir::ImplItemKind::Fn(..), .. })
+        | fhir::Node::ForeignItem(fhir::ForeignItem {
+            kind: fhir::ForeignItemKind::Fn(..), ..
+        }) => {
+            let wfckresults = genv.check_wf(def_id.local_id())?;
+            let (early, _) = genv.fhir_split_refinement_params(def_id.local_id())?;
+            let params = conv::conv_refinement_generics(&early, &wfckresults)?;
+            rty::RefinementGenerics { parent, parent_count, own_params: params }
         }
-        DefKind::TyAlias => {
-            let ty_alias = genv.map().get_type_alias(local_id);
-            let params =
-                conv::conv_refinement_generics(genv, &ty_alias.generics.refinement_params, None);
-            Ok(rty::RefinementGenerics { parent, parent_count, params })
-        }
-        _ => Ok(rty::RefinementGenerics { parent, parent_count, params: List::empty() }),
-    }
+        _ => rty::RefinementGenerics { parent, parent_count, own_params: rty::List::empty() },
+    };
+    Ok(rty::EarlyBinder(generics))
 }
 
-fn type_of(genv: &GlobalEnv, def_id: LocalDefId) -> QueryResult<rty::EarlyBinder<rty::PolyTy>> {
-    let ty = match genv.tcx.def_kind(def_id) {
-        DefKind::TyAlias { .. } => {
-            let alias = genv.map().get_type_alias(def_id);
-            let wfckresults = genv.check_wf(def_id)?;
-            conv::expand_type_alias(genv, alias, &wfckresults)?
+fn type_of(genv: GlobalEnv, def_id: MaybeExternId) -> QueryResult<rty::EarlyBinder<rty::TyOrCtor>> {
+    let ty = match genv.def_kind(def_id) {
+        DefKind::TyAlias => {
+            let fhir_ty_alias = genv
+                .fhir_expect_item(def_id.local_id())?
+                .expect_type_alias();
+            let wfckresults = genv.check_wf(def_id.local_id())?;
+            let mut cx = AfterSortck::new(genv, &wfckresults).into_conv_ctxt();
+            let ty_alias = cx.conv_type_alias(def_id, fhir_ty_alias)?;
+            struct_compat::type_alias(genv, fhir_ty_alias, &ty_alias, def_id)?;
+            rty::TyOrCtor::Ctor(ty_alias)
         }
         DefKind::TyParam => {
-            match &genv.get_generic_param(def_id).kind {
-                fhir::GenericParamKind::Type { default: Some(ty) } => {
-                    let wfckresults = genv.check_wf(def_id)?;
-                    conv::conv_ty(genv, ty, &wfckresults)?
+            match def_id {
+                MaybeExternId::Local(local_id) => {
+                    let owner = genv.tcx().hir_ty_param_owner(local_id);
+                    let param = genv.fhir_get_generics(owner)?.unwrap().get_param(local_id);
+                    match param.kind {
+                        fhir::GenericParamKind::Type { default: Some(ty) } => {
+                            let parent = genv.tcx().local_parent(local_id);
+                            let wfckresults = genv.check_wf(parent)?;
+                            conv::conv_default_type_parameter(genv, def_id, &ty, &wfckresults)?
+                                .into()
+                        }
+                        k => Err(query_bug!(local_id, "non-type def def {k:?} {def_id:?}"))?,
+                    }
                 }
-                k => bug!("non-type def {k:?} {def_id:?}"),
+                MaybeExternId::Extern(_, extern_id) => {
+                    let ty = genv.lower_type_of(extern_id)?.skip_binder();
+                    Refiner::default_for_item(genv, ty_param_owner(genv, extern_id))?
+                        .refine_ty_or_base(&ty)?
+                        .into()
+                }
             }
         }
         DefKind::Impl { .. } | DefKind::Struct | DefKind::Enum | DefKind::AssocTy => {
-            let generics = genv.generics_of(def_id)?;
             let ty = genv.lower_type_of(def_id)?.skip_binder();
-            Refiner::default(genv, &generics).refine_poly_ty(&ty)?
+            Refiner::default_for_item(genv, def_id.resolved_id())?
+                .refine_ty_or_base(&ty)?
+                .into()
         }
         kind => {
-            bug!("`{:?}` not supported", kind.descr(def_id.to_def_id()))
+            Err(query_bug!(
+                def_id.local_id(),
+                "`{:?}` not supported",
+                kind.descr(def_id.resolved_id())
+            ))?
         }
     };
     Ok(rty::EarlyBinder(ty))
 }
 
+fn ty_param_owner(genv: GlobalEnv, def_id: DefId) -> DefId {
+    let def_kind = genv.def_kind(def_id);
+    match def_kind {
+        DefKind::Trait | DefKind::TraitAlias => def_id,
+        DefKind::LifetimeParam | DefKind::TyParam | DefKind::ConstParam => {
+            genv.tcx().parent(def_id)
+        }
+        _ => bug!("ty_param_owner: {:?} is a {:?} not a type parameter", def_id, def_kind),
+    }
+}
+
 fn variants_of(
-    genv: &GlobalEnv,
-    def_id: LocalDefId,
+    genv: GlobalEnv,
+    def_id: MaybeExternId,
 ) -> QueryResult<rty::Opaqueness<rty::EarlyBinder<rty::PolyVariants>>> {
-    let variants = match genv.tcx.def_kind(def_id) {
-        DefKind::Enum => {
-            let enum_def = genv.map().get_enum(def_id);
-            let wfckresults = genv.check_wf(def_id)?;
-            let variants = conv::ConvCtxt::conv_enum_def_variants(genv, enum_def, &wfckresults)?
-                .into_iter()
-                .map(|variant| normalize(genv, variant))
-                .try_collect()?;
+    let local_id = def_id.local_id();
+
+    let item = &genv.fhir_expect_item(local_id)?;
+    let variants = match &item.kind {
+        fhir::ItemKind::Enum(enum_def) => {
+            let wfckresults = genv.check_wf(local_id)?;
+            let mut cx = AfterSortck::new(genv, &wfckresults).into_conv_ctxt();
+            let variants = cx.conv_enum_variants(def_id, enum_def)?;
+            let variants = rty::List::from_vec(struct_compat::variants(genv, &variants, def_id)?);
             rty::Opaqueness::Transparent(rty::EarlyBinder(variants))
         }
-        DefKind::Struct => {
-            let struct_def = genv.map().get_struct(def_id);
-            let wfckresults = genv.check_wf(def_id)?;
-            conv::ConvCtxt::conv_struct_def_variant(genv, struct_def, &wfckresults)?
-                .normalize(genv.defns()?)
-                .map(|variant| rty::EarlyBinder(List::singleton(variant)))
+        fhir::ItemKind::Struct(struct_def) => {
+            let wfckresults = genv.check_wf(local_id)?;
+            let mut cx = AfterSortck::new(genv, &wfckresults).into_conv_ctxt();
+            cx.conv_struct_variant(def_id, struct_def)?
+                .map(|variant| -> QueryResult<_> {
+                    let variants = struct_compat::variants(genv, &[variant], def_id)?;
+                    Ok(rty::List::from_vec(variants))
+                })
+                .transpose()?
+                .map(rty::EarlyBinder)
         }
-        kind => {
-            bug!("expected struct or enum found `{kind:?}`")
-        }
+        _ => Err(query_bug!(def_id.local_id(), "expected struct or enum"))?,
     };
     if config::dump_rty() {
-        dbg::dump_item_info(genv.tcx, def_id, "rty", &variants).unwrap();
+        dbg::dump_item_info(genv.tcx(), def_id.resolved_id(), "rty", &variants).unwrap();
     }
     Ok(variants)
 }
 
-fn fn_sig(genv: &GlobalEnv, def_id: LocalDefId) -> QueryResult<rty::EarlyBinder<rty::PolyFnSig>> {
-    let fn_sig = genv.map().get_fn_sig(def_id);
-    let wfckresults = genv.check_wf(def_id)?;
-    let defns = genv.defns()?;
-    let fn_sig = conv::conv_fn_sig(genv, def_id, fn_sig, &wfckresults)?
-        .map(|fn_sig| fn_sig.normalize(defns));
-
-    if config::dump_rty() {
-        let generics = genv.generics_of(def_id)?;
-        let refinement_generics = genv.refinement_generics_of(def_id)?;
-        dbg::dump_item_info(genv.tcx, def_id, "rty", (generics, refinement_generics, &fn_sig))
-            .unwrap();
-    }
-    Ok(fn_sig)
-}
-
-fn check_wf(genv: &GlobalEnv, flux_id: FluxLocalDefId) -> QueryResult<Rc<WfckResults>> {
-    match flux_id {
-        FluxLocalDefId::Flux(sym) => check_wf_flux_item(genv, sym),
-        FluxLocalDefId::Rust(def_id) => check_wf_rust_item(genv, def_id),
-    }
-}
-
-fn check_wf_flux_item(genv: &GlobalEnv, sym: Symbol) -> QueryResult<Rc<WfckResults>> {
-    let wfckresults = match genv.map().get_flux_item(sym).unwrap() {
-        fhir::FluxItem::Qualifier(qualifier) => wf::check_qualifier(genv, qualifier)?,
-        fhir::FluxItem::Defn(defn) => wf::check_defn(genv, defn)?,
-    };
-    Ok(Rc::new(wfckresults))
-}
-
-fn check_wf_rust_item(genv: &GlobalEnv, def_id: LocalDefId) -> QueryResult<Rc<WfckResults>> {
-    let wfckresults = match genv.tcx.def_kind(def_id) {
-        DefKind::TyAlias { .. } => {
-            let alias = genv.map().get_type_alias(def_id);
-            let mut wfckresults = wf::check_ty_alias(genv, alias)?;
-            annot_check::check_alias(genv, &mut wfckresults, alias)?;
-            wfckresults
-        }
-        DefKind::Struct => {
-            let struct_def = genv.map().get_struct(def_id);
-            let mut wfckresults = wf::check_struct_def(genv, struct_def)?;
-            annot_check::check_struct_def(genv, &mut wfckresults, struct_def)?;
-            wfckresults
-        }
-        DefKind::Enum => {
-            let enum_def = genv.map().get_enum(def_id);
-            let mut wfckresults = wf::check_enum_def(genv, enum_def)?;
-            annot_check::check_enum_def(genv, &mut wfckresults, enum_def)?;
-            wfckresults
-        }
-        DefKind::Fn | DefKind::AssocFn => {
-            let owner_id = OwnerId { def_id };
-            let fn_sig = genv.map().get_fn_sig(def_id);
-            let mut wfckresults = wf::check_fn_sig(genv, fn_sig, owner_id)?;
-            annot_check::check_fn_sig(genv, &mut wfckresults, owner_id, fn_sig)?;
-            wfckresults
-        }
-        DefKind::OpaqueTy => {
-            let owner_id = OwnerId { def_id };
-            let opaque_ty = genv.map().get_opaque_ty(def_id);
-            wf::check_opaque_ty(genv, opaque_ty, owner_id)?
-        }
-        DefKind::Impl { .. } => {
-            let owner_id = OwnerId { def_id };
-            wf::check_impl(genv, genv.map().get_impl(def_id), owner_id)?
-        }
-        DefKind::Trait { .. } => {
-            // TODO(nilehmann) we should check the sorts of associated predicates are well-formed.
-            let owner_id = OwnerId { def_id };
-            WfckResults::new(owner_id)
-        }
-        DefKind::Closure | DefKind::Coroutine | DefKind::TyParam => {
-            let parent = genv.tcx.local_parent(def_id);
-            return genv.check_wf(parent);
-        }
-        kind => panic!("unexpected def kind `{kind:?}`"),
-    };
-    Ok(Rc::new(wfckresults))
-}
-
-pub fn check_crate_wf(genv: &GlobalEnv) -> Result<(), ErrorGuaranteed> {
-    let mut err: Option<ErrorGuaranteed> = None;
-
-    for def_id in genv.tcx.hir_crate_items(()).definitions() {
-        match genv.tcx.def_kind(def_id) {
-            DefKind::TyAlias { .. }
-            | DefKind::Struct
-            | DefKind::Enum
-            | DefKind::Fn
-            | DefKind::AssocFn
-            | DefKind::OpaqueTy => {
-                err = genv.check_wf(def_id).emit(genv.sess).err().or(err);
+fn fn_sig(genv: GlobalEnv, def_id: MaybeExternId) -> QueryResult<rty::EarlyBinder<rty::PolyFnSig>> {
+    let fhir_node = genv.fhir_node(def_id.local_id())?;
+    match &fhir_node {
+        fhir::Node::Item(Item { kind: ItemKind::Fn(fhir_fn_sig, ..), .. })
+        | fhir::Node::TraitItem(TraitItem { kind: TraitItemKind::Fn(fhir_fn_sig), .. })
+        | fhir::Node::ImplItem(ImplItem { kind: ImplItemKind::Fn(fhir_fn_sig), .. })
+        | fhir::Node::ForeignItem(ForeignItem {
+            kind: ForeignItemKind::Fn(fhir_fn_sig, ..), ..
+        }) => {
+            let wfckresults = genv.check_wf(def_id.local_id())?;
+            let fn_sig = AfterSortck::new(genv, &wfckresults)
+                .into_conv_ctxt()
+                .conv_fn_sig(def_id, fhir_fn_sig)?;
+            let fn_sig = struct_compat::fn_sig(genv, fhir_fn_sig.decl, &fn_sig, def_id)?;
+            let mut fn_sig =
+                if config::suggestions() { fn_sig.hoist_input_binders() } else { fn_sig };
+            // We aren't sure how to handle suggestions for Traits themselves
+            // and ForeignItems.
+            //
+            // Things get a bit messy with making ImplItem suggestions match the
+            // subtype for their parent trait, but for now we *will* offer them
+            // as suggestions; the user can resolve issues.
+            if !genv.no_suggestions(def_id.local_id())
+                && !matches!(fhir_node, fhir::Node::TraitItem(..) | fhir::Node::ForeignItem(..))
+            {
+                fn_sig = fn_sig.add_weak_kvars(genv, def_id.resolved_id())?;
             }
-            _ => {}
+
+            if config::dump_rty() {
+                let generics = genv.generics_of(def_id)?;
+                let refinement_generics = genv.refinement_generics_of(def_id)?;
+                dbg::dump_item_info(
+                    genv.tcx(),
+                    def_id.resolved_id(),
+                    "rty",
+                    (generics, refinement_generics, &fn_sig),
+                )
+                .unwrap();
+            }
+            Ok(rty::EarlyBinder(fn_sig))
         }
-    }
-
-    for defn in genv.map().defns() {
-        err = genv
-            .check_wf(FluxLocalDefId::Flux(defn.name))
-            .emit(genv.sess)
-            .err()
-            .or(err);
-    }
-
-    for qualifier in genv.map().qualifiers() {
-        err = genv
-            .check_wf(FluxLocalDefId::Flux(qualifier.name))
-            .emit(genv.sess)
-            .err()
-            .or(err);
-    }
-
-    let qualifiers = genv.map().qualifiers().map(|q| q.name).collect();
-    for (_, fn_quals) in genv.map().fn_quals() {
-        err = wf::check_fn_quals(genv.sess, &qualifiers, fn_quals)
-            .err()
-            .or(err);
-    }
-
-    if let Some(err) = err {
-        Err(err)
-    } else {
-        Ok(())
+        fhir::Node::Ctor => {
+            let tcx = genv.tcx();
+            let (adt_id, variant_idx) = match tcx.def_kind(def_id) {
+                DefKind::Ctor(CtorOf::Struct, _) => {
+                    let struct_id = tcx.parent(def_id.resolved_id());
+                    (struct_id, FIRST_VARIANT)
+                }
+                DefKind::Ctor(CtorOf::Variant, _) => {
+                    let variant_id = tcx.parent(def_id.resolved_id());
+                    let enum_id = tcx.parent(variant_id);
+                    let variant_idx = tcx.adt_def(enum_id).variant_index_with_id(variant_id);
+                    (enum_id, variant_idx)
+                }
+                _ => return Err(query_bug!("invalid `DefKind` for ctor node")),
+            };
+            genv.variant_sig(adt_id, variant_idx)?
+                .map(|sig| sig.to_poly_fn_sig(None))
+                .ok_or_query_err(adt_id)
+        }
+        node => Err(query_bug!("fn_sig called on unsupported node {node:?}")),
     }
 }
 
-fn normalize<T: TypeFoldable>(genv: &GlobalEnv, t: T) -> QueryResult<T> {
-    Ok(t.normalize(genv.defns()?))
+fn check_wf(genv: GlobalEnv, def_id: LocalDefId) -> QueryResult<Rc<WfckResults>> {
+    let node = genv.fhir_expect_owner_node(def_id)?;
+    let wfckresults = wf::check_node(genv, &node)?;
+    Ok(Rc::new(wfckresults))
 }
 
 mod errors {
+    use flux_errors::E0999;
     use flux_macros::Diagnostic;
+    use flux_middle::def_id::FluxLocalDefId;
     use rustc_span::{Span, Symbol};
 
     #[derive(Diagnostic)]
-    #[diag(fhir_analysis_definition_cycle, code = "FLUX")]
+    #[diag("cycle in definitions", code = E0999)]
     pub struct DefinitionCycle {
         #[primary_span]
-        #[label]
+        #[label("{$msg}")]
         span: Span,
         msg: String,
     }
 
+    #[derive(Diagnostic)]
+    #[diag("ill-formed axiom", code = E0999)]
+    #[note(
+        "every variable of an axiom must occur in an application of an uninterpreted function, which is used to instantiate the axiom"
+    )]
+    pub struct IllFormedAxiom {
+        #[primary_span]
+        span: Span,
+        #[label("`{$name}` does not occur in any application (trigger pattern) of the axiom")]
+        param_span: Span,
+        name: Symbol,
+    }
+
+    impl IllFormedAxiom {
+        pub(super) fn new(span: Span, param_span: Span, name: Symbol) -> Self {
+            Self { span, param_span, name }
+        }
+    }
+
     impl DefinitionCycle {
-        pub(super) fn new(span: Span, cycle: Vec<Symbol>) -> Self {
-            let root = format!("`{}`", cycle[0]);
-            let names: Vec<String> = cycle.iter().map(|s| format!("`{s}`")).collect();
+        pub(super) fn new(span: Span, cycle: Vec<FluxLocalDefId>) -> Self {
+            let root = format!("`{}`", cycle[0].name());
+            let names: Vec<String> = cycle.iter().map(|s| format!("`{}`", s.name())).collect();
             let msg = format!("{} -> {}", names.join(" -> "), root);
             Self { span, msg }
         }

@@ -1,97 +1,658 @@
-#![feature(lazy_cell)]
-
-use std::{io::Read, path::PathBuf, sync::LazyLock};
-
-use config::{Environment, File};
-use serde::Deserialize;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 pub use toml::Value;
+use tracing::Level;
+pub mod flags;
 
-const FLUX_ENV_VAR_PREFIX: &str = "FLUX";
-const FLUX_CONFIG_ENV_VAR: &str = "FLUX_CONFIG";
+use std::{
+    fmt,
+    io::Read,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::LazyLock,
+    time::Duration,
+};
 
-pub fn check_def() -> &'static str {
-    &CONFIG.check_def
+use flags::FLAGS;
+use serde::Deserialize;
+
+pub fn dump_checker_trace_info() -> bool {
+    match FLAGS.dump_checker_trace {
+        Some(l) => Level::INFO <= l,
+        None => false,
+    }
 }
 
-pub fn dump_timings() -> bool {
-    CONFIG.dump_timings
-}
-
-pub fn dump_checker_trace() -> bool {
-    CONFIG.dump_checker_trace
-}
-
-pub fn dump_mir() -> bool {
-    CONFIG.dump_mir
+pub fn dump_checker_trace() -> Option<Level> {
+    FLAGS.dump_checker_trace
 }
 
 pub fn dump_constraint() -> bool {
-    CONFIG.dump_constraint
+    FLAGS.dump_constraint
 }
 
 pub fn dump_fhir() -> bool {
-    CONFIG.dump_fhir
+    FLAGS.dump_fhir
 }
 
 pub fn dump_rty() -> bool {
-    CONFIG.dump_rty
+    FLAGS.dump_rty
 }
 
 pub fn pointer_width() -> PointerWidth {
-    CONFIG.pointer_width
+    FLAGS.pointer_width
 }
 
 pub fn log_dir() -> &'static PathBuf {
-    &CONFIG.log_dir
+    &FLAGS.log_dir
+}
+
+pub fn lean_dir() -> &'static PathBuf {
+    &FLAGS.lean_dir
+}
+
+pub fn lean_project() -> &'static str {
+    &FLAGS.lean_project
 }
 
 pub fn is_cache_enabled() -> bool {
-    CONFIG.cache
+    FLAGS.cache.is_some()
 }
 
-pub fn cache_path() -> PathBuf {
-    log_dir().join(&CONFIG.cache_file)
+pub fn trusted_default() -> bool {
+    FLAGS.trusted_default
 }
 
-pub fn check_overflow() -> bool {
-    CONFIG.check_overflow
+pub fn ignore_default() -> bool {
+    FLAGS.ignore_default
 }
 
-pub fn scrape_quals() -> bool {
-    CONFIG.scrape_quals
+pub fn lean() -> LeanMode {
+    FLAGS.lean
 }
 
-#[derive(Debug)]
-pub struct CrateConfig {
-    pub check_overflow: bool,
+pub fn cache_path() -> Option<&'static Path> {
+    FLAGS.cache.as_deref()
+}
+
+pub fn include_pattern() -> Option<&'static IncludePattern> {
+    FLAGS.include.as_ref()
+}
+
+pub fn trusted_pattern() -> Option<&'static IncludePattern> {
+    FLAGS.include_trusted.as_ref()
+}
+
+pub fn trusted_impl_pattern() -> Option<&'static IncludePattern> {
+    FLAGS.include_trusted_impl.as_ref()
+}
+
+fn check_overflow() -> OverflowMode {
+    FLAGS.check_overflow
+}
+
+fn uif_ops() -> UifOps {
+    FLAGS.uif_ops
+}
+
+fn allow_raw_deref() -> RawDerefMode {
+    FLAGS.allow_raw_deref
+}
+
+pub fn allow_uninterpreted_cast() -> bool {
+    FLAGS.allow_uninterpreted_cast
+}
+
+fn scrape_quals() -> bool {
+    FLAGS.scrape_quals
+}
+
+pub fn no_panic() -> bool {
+    FLAGS.no_panic
+}
+
+pub fn sysroot() -> Option<PathBuf> {
+    if let Some(p) = FLAGS.sysroot.as_deref() {
+        Some(p.to_path_buf())
+    } else {
+        let exe = std::env::current_exe().ok()?;
+        exe.parent().map(|p| p.to_path_buf())
+    }
+}
+
+fn solver() -> SmtSolver {
+    FLAGS.solver
+}
+
+pub fn catch_bugs() -> bool {
+    FLAGS.catch_bugs
+}
+
+pub fn annots() -> bool {
+    FLAGS.annots
+}
+
+pub fn timings() -> bool {
+    FLAGS.timings
+}
+
+pub fn verify() -> bool {
+    FLAGS.verify
+}
+
+pub fn summary() -> bool {
+    FLAGS.summary
+}
+
+pub fn full_compilation() -> bool {
+    FLAGS.full_compilation
+}
+
+pub fn std_extern_specs() -> bool {
+    FLAGS.std_extern_specs
+}
+
+pub fn verbose() -> bool {
+    FLAGS.flux_verbose
+}
+
+pub fn suggestions() -> bool {
+    FLAGS.suggestions
+}
+
+pub fn rerun_hint() -> bool {
+    FLAGS.rerun_hint
+}
+
+pub fn fixpoint_timeout() -> Option<Duration> {
+    FLAGS.fixpoint_timeout.map(Duration::from_secs)
+}
+
+/// Whether the driver is running under `cargo flux` (which sets `FLUX_CARGO=1`), as opposed to a
+/// direct `flux`/`flux-driver` invocation. Used to decide whether to emit the re-run hint.
+pub fn inside_cargo() -> bool {
+    std::env::var_os("FLUX_CARGO").is_some()
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(try_from = "String")]
+pub struct Pos {
+    pub file: String,
+    pub line: usize,
+    pub column: usize,
+}
+
+impl FromStr for Pos {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() != 3 {
+            return Err("span format should be '<file>:<line>:<column>'");
+        }
+        let file = parts[0].to_string();
+        let line = parts[1]
+            .parse::<usize>()
+            .map_err(|_| "invalid line number")?;
+        let column = parts[2]
+            .parse::<usize>()
+            .map_err(|_| "invalid column number")?;
+        Ok(Pos { file, line, column })
+    }
+}
+
+impl TryFrom<String> for Pos {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl fmt::Display for IncludePattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[")?;
+        write!(f, "glob:{:?},", self.glob)?;
+        for def in &self.defs {
+            write!(f, "def:{},", def)?;
+        }
+        for pos in &self.spans {
+            write!(f, "span:{}:{}:{}", pos.file, pos.line, pos.column)?;
+        }
+        write!(f, "]")?;
+        Ok(())
+    }
+}
+/// This specifies which `DefId` should be checked. It can be specified via multiple patterns
+/// of the form `-Finclude=<pattern>` and the `DefId` is checked if it matches *any* of the patterns.
+/// Patterns are checked relative to the current working directory.
+#[derive(Clone)]
+pub struct IncludePattern {
+    /// files matching the glob pattern, e.g. `glob:src/ascii/*.rs` to check all files in the `ascii` module
+    pub glob: GlobSet,
+    /// defs (`fn`, `enum`, ...) matching the given function name as a substring, e.g. `def:watermelon`
+    pub defs: Vec<String>,
+    /// fn whose implementation overlaps the file, line, e.g. `span:tests/tests/pos/detached/detach00.rs:13:3`
+    pub spans: Vec<Pos>,
+}
+
+impl IncludePattern {
+    fn new(includes: Vec<String>) -> Result<Self, String> {
+        let mut defs = Vec::new();
+        let mut spans = Vec::new();
+        let mut glob = GlobSetBuilder::new();
+        for include in includes {
+            if let Some(suffix) = include.strip_prefix("def:") {
+                defs.push(suffix.to_string());
+            } else if let Some(suffix) = include.strip_prefix("span:") {
+                spans.push(Pos::from_str(suffix)?);
+            } else {
+                let suffix = include.strip_prefix("glob:").unwrap_or(&include);
+                let glob_pattern = Glob::new(suffix.trim()).map_err(|_| "invalid glob pattern")?;
+                glob.add(glob_pattern);
+            }
+        }
+        let glob = glob.build().map_err(|_| "failed to build glob set")?;
+        Ok(IncludePattern { glob, defs, spans })
+    }
+}
+
+impl FromStr for IncludePattern {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(vec![s.to_string()])
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Default)]
+#[serde(try_from = "String")]
+pub enum LeanMode {
+    /// Don't do anything with lean
+    #[default]
+    Off,
+    /// Emit the lean definitions and VCs for externally proven items
+    Emit,
+    /// (Emit and) Check the lean definitions and VCs for externally proven items
+    Check,
+}
+
+impl LeanMode {
+    const ERROR: &'static str = "expected one of `emit`, or `check`";
+
+    pub fn is_emit(self) -> bool {
+        matches!(self, LeanMode::Emit)
+    }
+
+    pub fn is_check(self) -> bool {
+        matches!(self, LeanMode::Check)
+    }
+}
+
+impl FromStr for LeanMode {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.to_ascii_lowercase();
+        match s.as_str() {
+            "off" => Ok(LeanMode::Off),
+            "emit" => Ok(LeanMode::Emit),
+            "check" => Ok(LeanMode::Check),
+            _ => Err(Self::ERROR),
+        }
+    }
+}
+
+impl TryFrom<String> for LeanMode {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl fmt::Display for LeanMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LeanMode::Off => write!(f, "off"),
+            LeanMode::Emit => write!(f, "emit"),
+            LeanMode::Check => write!(f, "check"),
+        }
+    }
+}
+
+/// A binary operator that can be encoded as an uninterpreted function, see [`InferOpts::uif_ops`].
+/// These mirror the arithmetic and bitwise operators of the surface syntax.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UifOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    BitAnd,
+    BitOr,
+    BitXor,
+    BitShl,
+    BitShr,
+}
+
+impl UifOp {
+    /// Maps the surface syntax (token) of each operator to the operator.
+    const TOKENS: [(&'static str, UifOp); 10] = [
+        ("+", UifOp::Add),
+        ("-", UifOp::Sub),
+        ("*", UifOp::Mul),
+        ("/", UifOp::Div),
+        ("%", UifOp::Mod),
+        ("&", UifOp::BitAnd),
+        ("|", UifOp::BitOr),
+        ("^", UifOp::BitXor),
+        ("<<", UifOp::BitShl),
+        (">>", UifOp::BitShr),
+    ];
+
+    /// The operator written as `token` in the surface syntax, if any
+    pub fn from_token(token: &str) -> Option<UifOp> {
+        Self::TOKENS
+            .iter()
+            .find_map(|(tok, op)| (*tok == token).then_some(*op))
+    }
+
+    /// The surface syntax of the operator
+    fn token(self) -> &'static str {
+        match self {
+            UifOp::Add => "+",
+            UifOp::Sub => "-",
+            UifOp::Mul => "*",
+            UifOp::Div => "/",
+            UifOp::Mod => "%",
+            UifOp::BitAnd => "&",
+            UifOp::BitOr => "|",
+            UifOp::BitXor => "^",
+            UifOp::BitShl => "<<",
+            UifOp::BitShr => ">>",
+        }
+    }
+
+    fn bit(self) -> u16 {
+        1 << (self as u16)
+    }
+}
+
+/// A set of [`UifOp`]s. It is a bitset so [`InferOpts`] can be `Copy`. It is written as a comma
+/// separated list of operators, e.g., `*,/,%`.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(try_from = "String")]
+pub struct UifOps(u16);
+
+impl UifOps {
+    const ERROR: &'static str =
+        "expected a comma separated list of `+`, `-`, `*`, `/`, `%`, `&`, `|`, `^`, `<<`, or `>>`";
+
+    pub fn contains(self, op: UifOp) -> bool {
+        self.0 & op.bit() != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn insert(&mut self, op: UifOp) {
+        self.0 |= op.bit();
+    }
+
+    fn iter(self) -> impl Iterator<Item = UifOp> {
+        UifOp::TOKENS
+            .into_iter()
+            .map(|(_, op)| op)
+            .filter(move |op| self.contains(*op))
+    }
+}
+
+impl FromStr for UifOps {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut ops = UifOps::default();
+        let tokens = s
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty());
+        for token in tokens {
+            let op = UifOp::from_token(token).ok_or(Self::ERROR)?;
+            ops.insert(op);
+        }
+        Ok(ops)
+    }
+}
+
+impl TryFrom<String> for UifOps {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl fmt::Display for UifOps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tokens: Vec<_> = self.iter().map(UifOp::token).collect();
+        write!(f, "{}", tokens.join(","))
+    }
+}
+
+impl fmt::Debug for UifOps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "UifOps({self})")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Default)]
+#[serde(try_from = "String")]
+pub enum OverflowMode {
+    /// Strict-Underflow, No overflow checking
+    #[default]
+    None,
+    /// Lazy underflow, Lazy overflow checking; lose all information
+    /// unless values are known to be in valid range
+    Lazy,
+    /// Strict underflow, Lazy overflow checking; always check
+    /// unsignedness (non-negativity) but lazy for upper-bound
+    StrictUnder,
+    /// Strict underflow, Strict overflow checking; always check
+    /// values in valid range for type
+    Strict,
+}
+
+impl OverflowMode {
+    const ERROR: &'static str = "expected one of `none`, `lazy`, or `strict`";
+}
+impl FromStr for OverflowMode {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.to_ascii_lowercase();
+        match s.as_str() {
+            "none" => Ok(OverflowMode::None),
+            "lazy" => Ok(OverflowMode::Lazy),
+            "strict" => Ok(OverflowMode::Strict),
+            "strict-under" => Ok(OverflowMode::StrictUnder),
+            _ => Err(Self::ERROR),
+        }
+    }
+}
+
+impl TryFrom<String> for OverflowMode {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl fmt::Display for OverflowMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OverflowMode::None => write!(f, "none"),
+            OverflowMode::Lazy => write!(f, "lazy"),
+            OverflowMode::Strict => write!(f, "strict"),
+            OverflowMode::StrictUnder => write!(f, "strict-under"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Default)]
+#[serde(try_from = "String")]
+pub enum RawDerefMode {
+    /// Don't allow raw pointer dereferences (default)
+    #[default]
+    None,
+    /// Allow raw pointer dereferences
+    Ok,
+}
+
+impl RawDerefMode {
+    const ERROR: &'static str = "expected one of `none` or `ok`";
+}
+
+impl FromStr for RawDerefMode {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.to_ascii_lowercase();
+        match s.as_str() {
+            "none" => Ok(RawDerefMode::None),
+            "ok" => Ok(RawDerefMode::Ok),
+            _ => Err(Self::ERROR),
+        }
+    }
+}
+
+impl TryFrom<String> for RawDerefMode {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl fmt::Display for RawDerefMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RawDerefMode::None => write!(f, "none"),
+            RawDerefMode::Ok => write!(f, "ok"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Default)]
+#[serde(try_from = "String")]
+pub enum SmtSolver {
+    #[default]
+    Z3,
+    CVC5,
+}
+
+impl SmtSolver {
+    const ERROR: &'static str = "expected one of `z3` or `cvc5`";
+}
+
+impl FromStr for SmtSolver {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.to_ascii_lowercase();
+        match s.as_str() {
+            "z3" => Ok(SmtSolver::Z3),
+            "cvc5" => Ok(SmtSolver::CVC5),
+            _ => Err(Self::ERROR),
+        }
+    }
+}
+
+impl TryFrom<String> for SmtSolver {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl fmt::Display for SmtSolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SmtSolver::Z3 => write!(f, "z3"),
+            SmtSolver::CVC5 => write!(f, "cvc5"),
+        }
+    }
+}
+
+/// Options that change the behavior of refinement type inference locally
+#[derive(Clone, Copy, Debug)]
+pub struct InferOpts {
+    /// Enable overflow checking. This affects the signature of primitive operations and the
+    /// invariants assumed for primitive types.
+    pub check_overflow: OverflowMode,
+    /// Whether qualifiers should be scraped from the constraint.
     pub scrape_quals: bool,
+    pub solver: SmtSolver,
+    /// Whether to allow uninterpreted casts (e.g., from some random `S` to `int`).
+    pub allow_uninterpreted_cast: bool,
+    /// Whether to allow raw pointer dereferences.
+    pub allow_raw_deref: RawDerefMode,
+    /// Binary operators that are encoded as uninterpreted functions (e.g. to avoid nonlinear arithmetic).
+    pub uif_ops: UifOps,
 }
 
-#[derive(Deserialize)]
-struct Config {
-    log_dir: PathBuf,
-    dump_constraint: bool,
-    dump_checker_trace: bool,
-    dump_timings: bool,
-    dump_fhir: bool,
-    dump_rty: bool,
-    dump_mir: bool,
-    pointer_width: PointerWidth,
-    check_def: String,
-    cache: bool,
-    cache_file: String,
-    check_overflow: bool,
-    scrape_quals: bool,
+impl From<PartialInferOpts> for InferOpts {
+    fn from(opts: PartialInferOpts) -> Self {
+        InferOpts {
+            check_overflow: opts.check_overflow.unwrap_or_else(check_overflow),
+            scrape_quals: opts.scrape_quals.unwrap_or_else(scrape_quals),
+            solver: opts.solver.unwrap_or_else(solver),
+            allow_uninterpreted_cast: opts
+                .allow_uninterpreted_cast
+                .unwrap_or_else(allow_uninterpreted_cast),
+            allow_raw_deref: opts.allow_raw_deref.unwrap_or_else(allow_raw_deref),
+            uif_ops: opts.uif_ops.unwrap_or_else(uif_ops),
+        }
+    }
 }
 
-#[derive(Copy, Clone, Deserialize)]
-#[serde(try_from = "u8")]
+#[derive(Clone, Copy, Default, Deserialize, Debug)]
+pub struct PartialInferOpts {
+    pub check_overflow: Option<OverflowMode>,
+    pub scrape_quals: Option<bool>,
+    pub solver: Option<SmtSolver>,
+    pub allow_uninterpreted_cast: Option<bool>,
+    pub allow_raw_deref: Option<RawDerefMode>,
+    pub uif_ops: Option<UifOps>,
+}
+
+impl PartialInferOpts {
+    pub fn merge(&mut self, other: &Self) {
+        self.check_overflow = self.check_overflow.or(other.check_overflow);
+        self.allow_uninterpreted_cast = self
+            .allow_uninterpreted_cast
+            .or(other.allow_uninterpreted_cast);
+        self.scrape_quals = self.scrape_quals.or(other.scrape_quals);
+        self.solver = self.solver.or(other.solver);
+        self.allow_raw_deref = self.allow_raw_deref.or(other.allow_raw_deref);
+        self.uif_ops = self.uif_ops.or(other.uif_ops);
+    }
+}
+
+#[derive(Copy, Clone, Deserialize, Default)]
 pub enum PointerWidth {
     W32,
+    #[default]
     W64,
 }
 
 impl PointerWidth {
+    const ERROR: &str = "pointer width must be 32 or 64";
+
     pub fn bits(self) -> u64 {
         match self {
             PointerWidth::W32 => 32,
@@ -100,53 +661,19 @@ impl PointerWidth {
     }
 }
 
-impl TryFrom<u8> for PointerWidth {
-    type Error = &'static str;
+impl FromStr for PointerWidth {
+    type Err = &'static str;
 
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            32 => Ok(PointerWidth::W32),
-            64 => Ok(PointerWidth::W64),
-            _ => Err("pointer width must be 32 or 64"),
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "32" => Ok(PointerWidth::W32),
+            "64" => Ok(PointerWidth::W64),
+            _ => Err(Self::ERROR),
         }
     }
 }
 
-static CONFIG: LazyLock<Config> = LazyLock::new(|| {
-    fn build() -> Result<Config, config::ConfigError> {
-        let mut config_builder = config::Config::builder()
-            .set_default("driver_path", None::<String>)?
-            .set_default("log_dir", "./log/")?
-            .set_default("dump_constraint", false)?
-            .set_default("dump_checker_trace", false)?
-            .set_default("dump_timings", false)?
-            .set_default("dump_mir", false)?
-            .set_default("dump_fhir", false)?
-            .set_default("dump_rty", false)?
-            .set_default("check_asserts", "assume")?
-            .set_default("pointer_width", "64")?
-            .set_default("check_def", "")?
-            .set_default("cache", false)?
-            .set_default("cache_file", "cache.json")?
-            .set_default("check_overflow", false)?
-            .set_default("scrape_quals", false)?;
-        // Config comes first, enviroment settings override it.
-        if let Some(config_path) = CONFIG_PATH.as_ref() {
-            config_builder = config_builder.add_source(File::from(config_path.clone()));
-        };
-        config_builder
-            .add_source(Environment::with_prefix(FLUX_ENV_VAR_PREFIX).ignore_empty(true))
-            .build()?
-            .try_deserialize()
-    }
-    build().unwrap()
-});
-
-pub static CONFIG_PATH: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
-    if let Ok(file) = std::env::var(FLUX_CONFIG_ENV_VAR) {
-        return Some(PathBuf::from(file));
-    }
-
+fn config_path() -> Option<PathBuf> {
     // find config file in current or parent directories
     let mut path = std::env::current_dir().unwrap();
     loop {
@@ -160,10 +687,10 @@ pub static CONFIG_PATH: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
             return None;
         }
     }
-});
+}
 
 pub static CONFIG_FILE: LazyLock<Value> = LazyLock::new(|| {
-    if let Some(path) = &*CONFIG_PATH {
+    if let Some(path) = config_path() {
         let mut file = std::fs::File::open(path).unwrap();
         let mut contents = String::new();
         file.read_to_string(&mut contents).unwrap();
@@ -172,9 +699,3 @@ pub static CONFIG_FILE: LazyLock<Value> = LazyLock::new(|| {
         toml::from_str("").unwrap()
     }
 });
-
-impl Default for CrateConfig {
-    fn default() -> Self {
-        Self { check_overflow: check_overflow(), scrape_quals: scrape_quals() }
-    }
-}

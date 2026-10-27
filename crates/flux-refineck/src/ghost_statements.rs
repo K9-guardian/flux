@@ -3,80 +3,144 @@
 mod fold_unfold;
 mod points_to;
 
-use std::{fmt, io, iter};
+use std::{fmt, iter};
 
-use flux_common::dbg;
-use flux_config as config;
-use flux_middle::{
-    global_env::GlobalEnv,
-    queries::QueryResult,
-    rustc::{
-        lowering,
-        mir::{BasicBlock, Body, Place},
-    },
+use flux_common::bug;
+use flux_middle::{global_env::GlobalEnv, queries::QueryResult};
+use flux_rustc_bridge::{
+    lowering,
+    mir::{BasicBlock, Body, BodyRoot, Place},
 };
 use rustc_data_structures::unord::UnordMap;
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir::def_id::LocalDefId;
-use rustc_middle::{mir::Location, ty::TyCtxt};
+use rustc_hir::{def::DefKind, def_id::LocalDefId};
+use rustc_middle::{
+    mir::{BorrowKind, Location, Promoted, START_BLOCK},
+    ty::TyCtxt,
+};
 
-pub(crate) struct GhostStatements {
-    at_location: LocationMap,
-    at_edge: EdgeMap,
+type LocationMap = UnordMap<Location, Vec<GhostStatement>>;
+type EdgeMap = UnordMap<BasicBlock, FxHashMap<BasicBlock, Vec<GhostStatement>>>;
+
+/// A type to indicate _who_ the ghost statements are for: either a regular `DefId` (including closures)  a promoted body.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum CheckerId {
+    /// A regular function or closure
+    DefId(LocalDefId),
+    /// A promoted body (within a function or closure)
+    Promoted(LocalDefId, Promoted),
 }
 
-type LocationMap = FxHashMap<Location, Vec<GhostStatement>>;
-type EdgeMap = FxHashMap<BasicBlock, FxHashMap<BasicBlock, Vec<GhostStatement>>>;
+impl CheckerId {
+    pub fn root_id(&self) -> LocalDefId {
+        match self {
+            CheckerId::DefId(def_id) => *def_id,
+            CheckerId::Promoted(def_id, _) => *def_id,
+        }
+    }
+
+    pub fn is_promoted(&self) -> bool {
+        matches!(self, CheckerId::Promoted(_, _))
+    }
+}
+
+pub(crate) fn compute_ghost_statements(
+    genv: GlobalEnv,
+    def_id: LocalDefId,
+) -> QueryResult<UnordMap<CheckerId, GhostStatements>> {
+    let mut data = UnordMap::default();
+    for def_id in all_nested_bodies(genv.tcx(), def_id) {
+        let key = CheckerId::DefId(def_id);
+        data.insert(key, GhostStatements::new(genv, key)?);
+        for promoted in genv.mir(def_id)?.promoted.indices() {
+            let key = CheckerId::Promoted(def_id, promoted);
+            data.insert(key, GhostStatements::new(genv, key)?);
+        }
+    }
+    Ok(data)
+}
 
 pub(crate) enum GhostStatement {
     Fold(Place),
     Unfold(Place),
     Unblock(Place),
-    PtrToBorrow(Place),
+    PtrToRef(Place),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum Point {
-    Location(Location),
-    Edge(BasicBlock, BasicBlock),
-}
-
-pub(crate) fn compute_ghost_statements(
-    genv: &GlobalEnv,
-    def_id: LocalDefId,
-) -> QueryResult<UnordMap<LocalDefId, GhostStatements>> {
-    let mut data = UnordMap::default();
-    for def_id in all_nested_bodies(genv.tcx, def_id) {
-        data.insert(def_id, GhostStatements::new(genv, def_id)?);
+impl fmt::Debug for GhostStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GhostStatement::Fold(place) => write!(f, "fold({place:?})"),
+            GhostStatement::Unfold(place) => write!(f, "unfold({place:?})"),
+            GhostStatement::Unblock(place) => write!(f, "unblock({place:?})"),
+            GhostStatement::PtrToRef(place) => write!(f, "ptr_to_ref({place:?})"),
+        }
     }
-    Ok(data)
+}
+
+pub(crate) struct GhostStatements {
+    at_start: Vec<GhostStatement>,
+    at_location: LocationMap,
+    at_edge: EdgeMap,
 }
 
 impl GhostStatements {
-    fn new(genv: &GlobalEnv, def_id: LocalDefId) -> QueryResult<Self> {
-        let body = genv.mir(def_id)?;
+    fn new(genv: GlobalEnv, checker_id: CheckerId) -> QueryResult<Self> {
+        let def_id = checker_id.root_id();
+        let body_root = genv.mir(def_id)?;
+        let body = match checker_id {
+            CheckerId::DefId(_) => &body_root.body,
+            CheckerId::Promoted(_, promoted) => &body_root.promoted[promoted],
+        };
 
-        let mut stmts = Self { at_location: LocationMap::default(), at_edge: EdgeMap::default() };
+        bug::track_span(body.span(), || {
+            let mut stmts = Self {
+                at_start: Default::default(),
+                at_location: LocationMap::default(),
+                at_edge: EdgeMap::default(),
+            };
 
-        fold_unfold::add_ghost_statements(&mut stmts, genv, &body)?;
-        points_to::add_ghost_statements(&mut stmts, genv, body.rustc_body(), def_id)?;
-        stmts.add_unblocks(&body);
+            // We have fn_sig for function items, but not for closures, generators, statics, or promoteds.
+            let fn_sig =
+                if matches!(genv.def_kind(def_id), DefKind::Closure | DefKind::Static { .. })
+                    || checker_id.is_promoted()
+                {
+                    None
+                } else {
+                    Some(genv.fn_sig(def_id)?)
+                };
 
-        if config::dump_mir() {
-            let mut writer =
-                dbg::writer_for_item(genv.tcx, def_id.to_def_id(), "ghost.mir").unwrap();
-            stmts.write_mir(genv.tcx, &body, &mut writer).unwrap();
-        }
-        Ok(stmts)
+            fold_unfold::add_ghost_statements(&mut stmts, genv, body, fn_sig.as_ref())?;
+            points_to::add_ghost_statements(&mut stmts, genv, body.rustc_body(), fn_sig.as_ref())?;
+            // We only add unblock statements for the main body because borrows in promoted constants
+            // have to be live in the main body so they never go out of scope in the promoted body.
+            if !checker_id.is_promoted() {
+                stmts.add_unblocks(genv.tcx(), &body_root);
+            }
+            stmts.dump_ghost_mir(genv.tcx(), body);
+
+            Ok(stmts)
+        })
     }
 
-    fn add_unblocks(&mut self, body: &Body) {
-        for (location, borrows) in body.calculate_borrows_out_of_scope_at_location() {
-            let stmts = borrows.into_iter().map(|bidx| {
-                let borrow = body.borrow_data(bidx);
-                let place = lowering::lower_place(&borrow.borrowed_place).unwrap();
-                GhostStatement::Unblock(place)
-            });
+    fn add_unblocks<'tcx>(&mut self, tcx: TyCtxt<'tcx>, body_root: &BodyRoot<'tcx>) {
+        for (location, borrows) in body_root.calculate_borrows_out_of_scope_at_location() {
+            let stmts = borrows
+                .into_iter()
+                .filter(|bidx| {
+                    // Only mutable borrows of owned places ever block the place (via the
+                    // `ptr(mut, ℓ)` → `&mut` conversion in `TypeEnv::ptr_to_ref`). Shared and
+                    // fake borrows never block, so emitting an `Unblock` for them is at best a
+                    // no-op and at worst an ICE: the borrowed place may have been folded back to
+                    // a struct (e.g. `&s` live alongside `&s.b`), which `PlacesTree::unblock`
+                    // cannot traverse.
+                    matches!(body_root.borrow_data(*bidx).kind(), BorrowKind::Mut { .. })
+                })
+                .map(|bidx| {
+                    let borrow = body_root.borrow_data(bidx);
+                    let place = lowering::lower_place(tcx, &borrow.borrowed_place()).unwrap();
+                    GhostStatement::Unblock(place)
+                });
             self.at_location.entry(location).or_default().extend(stmts);
         }
     }
@@ -87,7 +151,10 @@ impl GhostStatements {
 
     fn extend_at(&mut self, point: Point, stmts: impl IntoIterator<Item = GhostStatement>) {
         match point {
-            Point::Location(location) => {
+            Point::FunEntry => {
+                self.at_start.extend(stmts);
+            }
+            Point::BeforeLocation(location) => {
                 self.at_location.entry(location).or_default().extend(stmts);
             }
             Point::Edge(from, to) => {
@@ -101,13 +168,16 @@ impl GhostStatements {
         }
     }
 
-    fn at(&mut self, point: Point) -> StatementsAt {
+    fn at(&mut self, point: Point) -> StatementsAt<'_> {
         StatementsAt { stmts: self, point }
     }
 
     pub(crate) fn statements_at(&self, point: Point) -> impl Iterator<Item = &GhostStatement> {
         match point {
-            Point::Location(location) => self.at_location.get(&location).into_iter().flatten(),
+            Point::FunEntry => Some(&self.at_start).into_iter().flatten(),
+            Point::BeforeLocation(location) => {
+                self.at_location.get(&location).into_iter().flatten()
+            }
             Point::Edge(from, to) => {
                 self.at_edge
                     .get(&from)
@@ -118,43 +188,55 @@ impl GhostStatements {
         }
     }
 
-    pub(crate) fn write_mir<'tcx, W: io::Write>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        body: &Body<'tcx>,
-        w: &mut W,
-    ) -> io::Result<()> {
-        use rustc_middle::mir::PassWhere;
-        rustc_middle::mir::pretty::write_mir_fn(
-            tcx,
-            body.inner(),
-            &mut |pass, w| {
-                match pass {
-                    PassWhere::BeforeLocation(location) => {
-                        for stmt in self.statements_at(Point::Location(location)) {
-                            writeln!(w, "        {stmt:?};")?;
-                        }
-                    }
-                    PassWhere::AfterTerminator(bb) => {
-                        if let Some(map) = self.at_edge.get(&bb) {
-                            writeln!(w)?;
-                            for (target, stmts) in map {
-                                write!(w, "        -> {target:?} {{")?;
-                                for stmt in stmts {
-                                    write!(w, "\n            {stmt:?};")?;
-                                }
-                                write!(w, "\n        }}")?;
+    pub(crate) fn dump_ghost_mir<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &Body<'tcx>) {
+        use rustc_middle::mir::{PassWhere, pretty::MirDumper};
+        if let Some(dumper) = MirDumper::new(tcx, "ghost", body.rustc_body()) {
+            dumper
+                .set_extra_data(&|pass, w| {
+                    match pass {
+                        PassWhere::BeforeBlock(bb) if bb == START_BLOCK => {
+                            for stmt in &self.at_start {
+                                writeln!(w, "    {stmt:?};")?;
                             }
-                            writeln!(w)?;
                         }
+                        PassWhere::BeforeLocation(location) => {
+                            for stmt in self.statements_at(Point::BeforeLocation(location)) {
+                                writeln!(w, "        {stmt:?};")?;
+                            }
+                        }
+                        PassWhere::AfterTerminator(bb) => {
+                            if let Some(map) = self.at_edge.get(&bb) {
+                                writeln!(w)?;
+                                for (target, stmts) in map {
+                                    write!(w, "        -> {target:?} {{")?;
+                                    for stmt in stmts {
+                                        write!(w, "\n            {stmt:?};")?;
+                                    }
+                                    write!(w, "\n        }}")?;
+                                }
+                                writeln!(w)?;
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
-                Ok(())
-            },
-            w,
-        )
+                    Ok(())
+                })
+                .dump_mir(body.rustc_body());
+        }
     }
+}
+
+/// A point in the control flow graph where ghost statements can be inserted.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Point {
+    /// The entry of the function before the first basic block. This is not the same as the first
+    /// location in the first basic block because, for some functions, the first basic block can have
+    /// incoming edges, and we want to execute ghost statements only once.
+    FunEntry,
+    /// The point before a location in a basic block.
+    BeforeLocation(Location),
+    /// An edge between two basic blocks.
+    Edge(BasicBlock, BasicBlock),
 }
 
 struct StatementsAt<'a> {
@@ -170,19 +252,19 @@ impl StatementsAt<'_> {
 
 fn all_nested_bodies(tcx: TyCtxt, def_id: LocalDefId) -> impl Iterator<Item = LocalDefId> {
     use rustc_hir as hir;
-    struct ClosureFinder<'hir> {
-        hir: rustc_middle::hir::map::Map<'hir>,
+    struct ClosureFinder<'tcx> {
+        tcx: TyCtxt<'tcx>,
         closures: FxHashSet<LocalDefId>,
     }
 
-    impl<'hir> rustc_hir::intravisit::Visitor<'hir> for ClosureFinder<'hir> {
+    impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for ClosureFinder<'tcx> {
         type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
 
-        fn nested_visit_map(&mut self) -> Self::Map {
-            self.hir
+        fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+            self.tcx
         }
 
-        fn visit_expr(&mut self, ex: &'hir hir::Expr<'hir>) {
+        fn visit_expr(&mut self, ex: &'tcx hir::Expr<'tcx>) {
             if let hir::ExprKind::Closure(closure) = ex.kind {
                 self.closures.insert(closure.def_id);
             }
@@ -190,21 +272,8 @@ fn all_nested_bodies(tcx: TyCtxt, def_id: LocalDefId) -> impl Iterator<Item = Lo
             hir::intravisit::walk_expr(self, ex);
         }
     }
-    let hir = tcx.hir();
-    let body_id = hir.body_owned_by(def_id);
-    let body_expr = hir.body(body_id).value;
-    let mut finder = ClosureFinder { hir, closures: FxHashSet::default() };
-    hir::intravisit::Visitor::visit_expr(&mut finder, body_expr);
+    let body = tcx.hir_body_owned_by(def_id).value;
+    let mut finder = ClosureFinder { tcx, closures: FxHashSet::default() };
+    hir::intravisit::Visitor::visit_expr(&mut finder, body);
     finder.closures.into_iter().chain(iter::once(def_id))
-}
-
-impl fmt::Debug for GhostStatement {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            GhostStatement::Fold(place) => write!(f, "fold({place:?})"),
-            GhostStatement::Unfold(place) => write!(f, "unfold({place:?})"),
-            GhostStatement::Unblock(place) => write!(f, "unblock({place:?})"),
-            GhostStatement::PtrToBorrow(place) => write!(f, "ptr_to_borrow({place:?})"),
-        }
-    }
 }
